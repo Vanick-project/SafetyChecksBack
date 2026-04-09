@@ -1,0 +1,127 @@
+// Safety Check — Prisma Schema
+// Run: npx prisma migrate dev --name init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  
+}
+
+// ─── USERS ───────────────────────────────────────────────────────────────────
+
+model User {
+  id          String   @id @default(uuid())
+  phoneNumber String   @unique
+  firstName   String?
+  address     String
+  city        String
+  country     String
+  zipCode     String
+  fcmToken    String?           // Firebase push token, updated on login
+  lastLat     Float?            // Updated every ~15 min by background sync
+  lastLng     Float?
+  status      UserStatus @default(ACTIVE)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  lastCheckInAt DateTime?
+  emergencyContact EmergencyContact?
+  checkInEvents    CheckInEvent[]
+  alertEvents      AlertEvent[]
+}
+
+enum UserStatus {
+  ACTIVE
+  PAUSED    // User temporarily disabled check-ins (e.g. on holiday)
+  DELETED
+}
+
+// ─── EMERGENCY CONTACTS ──────────────────────────────────────────────────────
+
+model EmergencyContact {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  name         String
+  phoneNumber  String
+  relationship String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ─── CHECK-IN EVENTS ─────────────────────────────────────────────────────────
+
+model CheckInEvent {
+  id            String          @id @default(uuid())
+  userId        String
+  sentAt        DateTime        @default(now())
+  respondedAt   DateTime?
+  response      CheckInResponse?
+  attemptNumber Int             @default(1)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+enum CheckInResponse {
+  OK
+  SOS
+}
+
+// ─── ALERT EVENTS ────────────────────────────────────────────────────────────
+
+model AlertEvent {
+  id            String      @id @default(uuid())
+  userId        String
+  triggerReason AlertReason
+  triggeredAt   DateTime    @default(now())
+  resolvedAt    DateTime?
+  status        AlertStatus @default(ACTIVE)
+  latAtTrigger Float?
+  lngAtTrigger Float?
+
+  user    User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  actions AlertAction[]
+
+  @@index([userId])
+}
+
+enum AlertReason {
+  NO_RESPONSE_AFTER_2_ATTEMPTS
+  NO_RESPONSE_AFTER_3_REMINDERS
+  USER_PRESSED_SOS
+}
+
+enum AlertStatus {
+  ACTIVE
+  RESOLVED   // User confirmed they are safe
+  CANCELLED  // False alarm cancelled by user
+  FAILED
+}
+
+// ─── ALERT ACTIONS (audit log) ───────────────────────────────────────────────
+
+model AlertAction {
+  id          String     @id @default(uuid())
+  alertId     String
+  actionType  ActionType
+  destination String     // Phone number the action was sent to
+  outcome     String     // Twilio status string e.g. "queued", "delivered"
+  providerSid String?
+  executedAt  DateTime   @default(now())
+
+  alert AlertEvent @relation(fields: [alertId], references: [id], onDelete: Cascade)
+
+  @@index([alertId])
+}
+
+enum ActionType {
+  CALL
+  SMS
+  PUSH
+  USER_RESOLVED
+}
