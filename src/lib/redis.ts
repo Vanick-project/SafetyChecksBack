@@ -13,6 +13,9 @@ if (!process.env.REDIS_URL) {
   throw new Error("Missing REDIS_URL");
 }
 
+const redisUrl = new URL(process.env.REDIS_URL);
+console.log("✅ Redis host:", redisUrl.host);
+
 export const redisConnection = new Redis(process.env.REDIS_URL, {
   maxRetriesPerRequest: null,
 });
