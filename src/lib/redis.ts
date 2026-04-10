@@ -7,7 +7,7 @@ export const redisConnection = new Redis({
   maxRetriesPerRequest: null,
 }); 
 */
-let redisConnection: any = null;
+import { Redis } from "ioredis";
 
 if (process.env.REDIS_URL) {
   const { Redis } = require("ioredis");
