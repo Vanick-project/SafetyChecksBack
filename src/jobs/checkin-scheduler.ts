@@ -17,7 +17,10 @@ if (process.env.REDIS_URL) {
   console.log("⚠️ Redis disabled (no REDIS_URL)");
 }
 
-export const checkInQueue = new Queue("check-in", { connection });
+//export const checkInQueue = new Queue("check-in", { connection });
+export const checkInQueue = connection
+  ? new Queue("check-in", { connection })
+  : null;
 
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
 const TEN_MINUTES = 10 * 60 * 1000;
