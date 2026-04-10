@@ -42,5 +42,5 @@
     "skipLibCheck": true,
     "esModuleInterop": true
   },
-  "include": ["src", "prisma.config.ts"]
+  "include": ["src"]
 }
