@@ -4,9 +4,18 @@ import { sendCheckInNotification } from "../services/fcm.js";
 import { sendLocationSMS, callEmergencyContact } from "../services/twilio.js";
 import { db } from "../db/client.js";
 
-const connection = new Redis(process.env.REDIS_URL!, {
+/*const connection = new Redis(process.env.REDIS_URL!, {
   maxRetriesPerRequest: null,
-});
+});*/
+let connection: any = null;
+
+if (process.env.REDIS_URL) {
+  connection = new Redis(process.env.REDIS_URL, {
+    maxRetriesPerRequest: null,
+  });
+} else {
+  console.log("⚠️ Redis disabled (no REDIS_URL)");
+}
 
 export const checkInQueue = new Queue("check-in", { connection });
 
