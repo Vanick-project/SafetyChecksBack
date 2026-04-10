@@ -7,4 +7,13 @@ export const redisConnection = new Redis({
   maxRetriesPerRequest: null,
 }); 
 */
-export const redisConnection = null;
+let redisConnection: any = null;
+
+if (process.env.REDIS_URL) {
+  const { Redis } = require("ioredis");
+  redisConnection = new Redis(process.env.REDIS_URL);
+} else {
+  console.log("⚠️ Redis disabled (no REDIS_URL)");
+}
+
+export { redisConnection };
