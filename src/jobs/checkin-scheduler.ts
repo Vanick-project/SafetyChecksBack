@@ -4,21 +4,18 @@ import { sendCheckInNotification } from "../services/fcm.js";
 import { sendLocationSMS, callEmergencyContact } from "../services/twilio.js";
 import { db } from "../db/client.js";
 
-/*const connection = new Redis(process.env.REDIS_URL!, {
-  maxRetriesPerRequest: null,
-});*/
-let connection: any = null;
+let connection: Redis | null = null;
 
 if (process.env.REDIS_URL) {
   connection = new Redis(process.env.REDIS_URL, {
     maxRetriesPerRequest: null,
+    tls: {},
   });
 } else {
   console.log("⚠️ Redis disabled (no REDIS_URL)");
 }
 
-//export const checkInQueue = new Queue("check-in", { connection });
-export const checkInQueue = connection
+export const checkInQueue: Queue | null = connection
   ? new Queue("check-in", { connection })
   : null;
 
@@ -27,6 +24,11 @@ const TEN_MINUTES = 10 * 60 * 1000;
 const MAX_REMINDERS = 3;
 
 export async function scheduleCheckIn(userId: string) {
+  if (!checkInQueue) {
+    console.log("⚠️ Check-in queue unavailable (Redis disabled)");
+    return;
+  }
+
   const mainJob = await checkInQueue.getJob(`checkin-${userId}`);
   await mainJob?.remove();
 
@@ -47,6 +49,11 @@ export async function scheduleCheckIn(userId: string) {
 }
 
 export async function rescheduleAfterOk(userId: string) {
+  if (!checkInQueue) {
+    console.log("⚠️ Check-in queue unavailable (Redis disabled)");
+    return;
+  }
+
   const mainJob = await checkInQueue.getJob(`checkin-${userId}`);
   await mainJob?.remove();
 
@@ -127,120 +134,132 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
   await scheduleCheckIn(userId);
 }
 
-new Worker(
-  "check-in",
-  async (job: Job) => {
-    if (job.name === "send-check-in") {
-      const { userId, attempt } = job.data as {
-        userId: string;
-        attempt: number;
-      };
-
-      const user = await db.user.findUnique({
-        where: { id: userId },
-        select: {
-          id: true,
-          status: true,
-          lastCheckInAt: true,
-          fcmToken: true,
-        },
-      });
-
-      if (!user) {
-        console.log(`❌ User ${userId} not found`);
+if (connection) {
+  new Worker(
+    "check-in",
+    async (job: Job) => {
+      if (!checkInQueue) {
+        console.log("⚠️ Check-in queue unavailable");
         return;
       }
 
-      if (user.status !== "ACTIVE") {
-        console.log(`⏸️ User ${userId} is not ACTIVE, reminders stopped`);
-        return;
-      }
+      if (job.name === "send-check-in") {
+        const { userId, attempt } = job.data as {
+          userId: string;
+          attempt: number;
+        };
 
-      const latestUnansweredCheckIn = await db.checkInEvent.findFirst({
-        where: {
-          userId,
-          response: null,
-        },
-        orderBy: {
-          sentAt: "desc",
-        },
-      });
+        const user = await db.user.findUnique({
+          where: { id: userId },
+          select: {
+            id: true,
+            status: true,
+            lastCheckInAt: true,
+            fcmToken: true,
+          },
+        });
 
-      if (attempt > 1 && !latestUnansweredCheckIn) {
-        console.log(`✅ User ${userId} already responded, stop reminders`);
-        return;
-      }
+        if (!user) {
+          console.log(`❌ User ${userId} not found`);
+          return;
+        }
 
-      const checkIn = await db.checkInEvent.create({
-        data: {
-          userId,
-          sentAt: new Date(),
-          attemptNumber: attempt,
-        },
-      });
+        if (user.status !== "ACTIVE") {
+          console.log(`⏸️ User ${userId} is not ACTIVE, reminders stopped`);
+          return;
+        }
 
-      await sendCheckInNotification(userId, checkIn.id);
+        const latestUnansweredCheckIn = await db.checkInEvent.findFirst({
+          where: {
+            userId,
+            response: null,
+          },
+          orderBy: {
+            sentAt: "desc",
+          },
+        });
 
-      console.log(
-        `🔔 Check-in notification sent to user ${userId}, attempt ${attempt}`,
-      );
+        if (attempt > 1 && !latestUnansweredCheckIn) {
+          console.log(`✅ User ${userId} already responded, stop reminders`);
+          return;
+        }
 
-      if (attempt < MAX_REMINDERS) {
-        const reminderJob = await checkInQueue.getJob(
-          `checkin-reminder-${userId}`,
+        const checkIn = await db.checkInEvent.create({
+          data: {
+            userId,
+            sentAt: new Date(),
+            attemptNumber: attempt,
+          },
+        });
+
+        await sendCheckInNotification(userId, checkIn.id);
+
+        console.log(
+          `🔔 Check-in notification sent to user ${userId}, attempt ${attempt}`,
         );
-        await reminderJob?.remove();
+
+        if (attempt < MAX_REMINDERS) {
+          const reminderJob = await checkInQueue.getJob(
+            `checkin-reminder-${userId}`,
+          );
+          await reminderJob?.remove();
+
+          await checkInQueue.add(
+            "send-check-in",
+            { userId, attempt: attempt + 1 },
+            {
+              jobId: `checkin-reminder-${userId}`,
+              delay: TEN_MINUTES,
+              removeOnComplete: true,
+            },
+          );
+
+          console.log(
+            `⏳ Reminder ${attempt + 1} scheduled in 10 min for user ${userId}`,
+          );
+          return;
+        }
 
         await checkInQueue.add(
-          "send-check-in",
-          { userId, attempt: attempt + 1 },
+          "auto-sos",
           {
-            jobId: `checkin-reminder-${userId}`,
+            userId,
+            checkInId: checkIn.id,
+          },
+          {
+            jobId: `auto-sos-${userId}`,
             delay: TEN_MINUTES,
             removeOnComplete: true,
           },
         );
 
-        console.log(
-          `⏳ Reminder ${attempt + 1} scheduled in 10 min for user ${userId}`,
-        );
+        console.log(`🚨 Auto SOS scheduled in 10 min for user ${userId}`);
         return;
       }
 
-      await checkInQueue.add(
-        "auto-sos",
-        {
-          userId,
-          checkInId: checkIn.id,
-        },
-        {
-          jobId: `auto-sos-${userId}`,
-          delay: TEN_MINUTES,
-          removeOnComplete: true,
-        },
-      );
+      if (job.name === "auto-sos") {
+        const { userId, checkInId } = job.data as {
+          userId: string;
+          checkInId: string;
+        };
 
-      console.log(`🚨 Auto SOS scheduled in 10 min for user ${userId}`);
-      return;
-    }
-
-    if (job.name === "auto-sos") {
-      const { userId, checkInId } = job.data as {
-        userId: string;
-        checkInId: string;
-      };
-
-      await triggerAutomaticSOS(userId, checkInId);
-    }
-  },
-  { connection },
-);
+        await triggerAutomaticSOS(userId, checkInId);
+      }
+    },
+    { connection },
+  );
+}
 
 export async function handleUserResponse(
   userId: string,
   checkInId: string,
   response: "OK" | "SOS",
 ) {
+  if (!checkInQueue) {
+    console.log("⚠️ Check-in queue unavailable (Redis disabled)");
+    return;
+  }
+
   const mainJob = await checkInQueue.getJob(`checkin-${userId}`);
   await mainJob?.remove();
 
