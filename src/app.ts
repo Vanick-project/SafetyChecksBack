@@ -14,10 +14,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
+/*
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", message: "SafetyChecks backend is running" });
-});
+});*/
 
 app.use("/users", usersRouter);
 app.use("/checkins", checkInRouter);

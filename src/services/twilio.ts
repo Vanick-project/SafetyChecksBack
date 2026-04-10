@@ -101,7 +101,7 @@ export async function callEmergencyContact(alertId: string) {
     statusCallbackMethod: "POST",
     statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
     machineDetection: "Enable",
-    asyncAmd: true,
+    asyncAmd: "true",
     asyncAmdStatusCallback: `${process.env.API_BASE_URL}/twilio/amd-status`,
     asyncAmdStatusCallbackMethod: "POST",
   });

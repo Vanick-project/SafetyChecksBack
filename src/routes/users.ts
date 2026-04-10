@@ -47,8 +47,17 @@ router.post("/register", async (req: Request, res: Response) => {
 
     await db.emergencyContact.upsert({
       where: { userId: user.id },
-      update: emergencyContact,
-      create: { userId: user.id, ...emergencyContact },
+      update: {
+        name: emergencyContact.name,
+        phoneNumber: emergencyContact.phoneNumber,
+        relationship: emergencyContact.relationship ?? null,
+      },
+      create: {
+        userId: user.id,
+        name: emergencyContact.name,
+        phoneNumber: emergencyContact.phoneNumber,
+        relationship: emergencyContact.relationship ?? null,
+      },
     });
 
     return res.status(201).json({ userId: user.id });
