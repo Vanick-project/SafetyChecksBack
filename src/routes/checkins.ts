@@ -1,7 +1,12 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { db } from "../db/client.js";
-import { handleUserResponse } from "../jobs/checkin-scheduler.js";
+//import { handleUserResponse } from "../jobs/checkin-scheduler.js";
+
+// TEMP: disable Redis-dependent job
+const handleUserResponse = async () => {
+  console.log("⚠️ handleUserResponse skipped (Redis disabled)");
+};
 
 // ─── CHECK-IN ROUTES ─────────────────────────────────────────────────────────
 
