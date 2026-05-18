@@ -114,8 +114,7 @@ model AlertAction {
   outcome       String
   providerSid   String?
   executedAt    DateTime
-  // ADD THIS FIELD ↓
-  humanAnswered Boolean  @default(false)
+  humanAnswered Boolean  @default(false)   // ← AJOUTE CETTE LIGNE
 
   alert         AlertEvent @relation(fields: [alertId], references: [id])
 }
