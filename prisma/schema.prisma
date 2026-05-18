@@ -107,17 +107,17 @@ enum AlertStatus {
 // ─── ALERT ACTIONS (audit log) ───────────────────────────────────────────────
 
 model AlertAction {
-  id          String     @id @default(uuid())
-  alertId     String
-  actionType  ActionType
-  destination String     // Phone number the action was sent to
-  outcome     String     // Twilio status string e.g. "queued", "delivered"
-  providerSid String?
-  executedAt  DateTime   @default(now())
+  id            String   @id @default(cuid())
+  alertId       String
+  actionType    String
+  destination   String
+  outcome       String
+  providerSid   String?
+  executedAt    DateTime
+  // ADD THIS FIELD ↓
+  humanAnswered Boolean  @default(false)
 
-  alert AlertEvent @relation(fields: [alertId], references: [id], onDelete: Cascade)
-
-  @@index([alertId])
+  alert         AlertEvent @relation(fields: [alertId], references: [id])
 }
 
 enum ActionType {
