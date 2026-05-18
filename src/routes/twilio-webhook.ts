@@ -50,7 +50,6 @@ function validateTwilioSignature(
   res: Response,
   next: NextFunction,
 ) {
-  /*
   // In local/test environments you can skip validation by setting this var.
   if (process.env.SKIP_TWILIO_VALIDATION === "true") {
     return next();
@@ -73,7 +72,7 @@ function validateTwilioSignature(
   if (!isValid) {
     console.warn("⚠️ Invalid Twilio signature — request rejected:", fullUrl);
     return res.status(403).send("Forbidden");
-  } */
+  }
 
   return next();
 }
