@@ -42,7 +42,11 @@ checkInRouter.post("/respond", async (req: Request, res: Response) => {
 
     // Default to "scheduled" for backwards compatibility with clients that
     // don't yet send the `source` field.
-    const resolvedSource = source ?? "scheduled";
+    const resolvedSource =
+      source ??
+      (checkInId === "manual" || checkInId === "manual-sos"
+        ? "manual"
+        : "scheduled");
 
     await handleUserResponse(
       userId,
