@@ -1,25 +1,11 @@
 // ─── src/jobs/checkin-scheduler.ts ───────────────────────────────────────────
-// Schedules 24-hour check-in cycles, sends reminders, and triggers automatic
-// SOS after 3 unanswered reminders.
+// Check-in cycle: 24h → 5 notifications every 5 min → automatic SOS.
 //
-// FIXES applied:
-//   1. QUEUE BYPASS: `triggerAutomaticSOS` and `handleUserResponse (SOS branch)`
-//      previously called `sendLocationSMS` and `callEmergencyContact` directly,
-//      skipping the alertQueue entirely. This meant no deduplication, no retry
-//      on failure, and different behavior from the /alerts/trigger endpoint.
-//      Both now go through `alertQueue.add("sendEmergencyAlert", ...)`.
-//
-//   2. NULL COORDINATES: `latAtTrigger: user.lastLat ?? 0` was sending (0,0)
-//      — the middle of the Atlantic — when a user had no stored location.
-//      Changed to omit the fields when null, matching the /alerts/trigger logic.
-//
-//   3. MAGIC STRING IDs: `checkInId === "manual"` comparison is fragile.
-//      Replaced with an explicit `source` field in the payload type.
-//
-//   4. TLS: Removed `tls: {}` from the local Redis connection. The `rediss://`
-//      scheme in REDIS_URL already enables TLS in ioredis.
-//
-//   5. Constants imported from shared config (no more re-declared literals).
+// CHANGES vs previous version:
+//   - TEN_MINUTES replaced by FIVE_MINUTES (5 reminders × 5 min = 25 min window)
+//   - MAX_REMINDERS: 3 → 5
+//   - triggerReason updated to "NO_RESPONSE_AFTER_5_REMINDERS"
+//   - All other logic (queue bypass fix, null coords, source field) unchanged.
 
 import { Queue, Worker, Job } from "bullmq";
 import { Redis } from "ioredis";
@@ -28,35 +14,31 @@ import { db } from "../db/client.js";
 import { alertQueue } from "./alertQueue.js";
 import {
   TWENTY_FOUR_HOURS,
-  TEN_MINUTES,
+  FIVE_MINUTES,
   MAX_REMINDERS,
 } from "../config/constants.js";
 
-// ─── REDIS CONNECTION ─────────────────────────────────────────────────────────
-// FIX: No `tls: {}`. The `rediss://` scheme handles TLS automatically.
+// ─── REDIS ───────────────────────────────────────────────────────────────────
 
 let connection: Redis | null = null;
 
 if (process.env.REDIS_URL) {
   connection = new Redis(process.env.REDIS_URL, {
     maxRetriesPerRequest: null,
-    // DO NOT add tls: {} — rediss:// URL already enables TLS in ioredis.
   });
   connection.on("connect", () => console.log("✅ check-in Redis connected"));
   connection.on("error", (err) =>
     console.error("❌ check-in Redis error:", err.message),
   );
 } else {
-  console.warn(
-    "⚠️ Redis disabled — check-in queue will not function (no REDIS_URL)",
-  );
+  console.warn("⚠️ Redis disabled — check-in queue unavailable (no REDIS_URL)");
 }
 
 export const checkInQueue: Queue | null = connection
   ? new Queue("check-in", { connection })
   : null;
 
-// ─── SCHEDULE / RESCHEDULE ───────────────────────────────────────────────────
+// ─── SCHEDULE ────────────────────────────────────────────────────────────────
 
 export async function scheduleCheckIn(userId: string) {
   if (!checkInQueue) {
@@ -64,7 +46,6 @@ export async function scheduleCheckIn(userId: string) {
     return;
   }
 
-  // Clear any existing jobs for this user before scheduling a fresh one.
   const [mainJob, reminderJob] = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
     checkInQueue.getJob(`checkin-reminder-${userId}`),
@@ -89,19 +70,15 @@ export async function rescheduleAfterOk(userId: string) {
 }
 
 // ─── AUTOMATIC SOS ───────────────────────────────────────────────────────────
-// FIX: now enqueues via alertQueue instead of calling Twilio directly.
 
 async function triggerAutomaticSOS(userId: string, checkInId: string) {
-  // Guard: user may have responded between the scheduler firing and now.
   const latestCheckIn = await db.checkInEvent.findUnique({
     where: { id: checkInId },
     select: { response: true },
   });
 
   if (latestCheckIn?.response) {
-    console.log(
-      `✅ User ${userId} responded meanwhile — no automatic SOS needed`,
-    );
+    console.log(`✅ User ${userId} responded meanwhile — no SOS needed`);
     return;
   }
 
@@ -116,30 +93,25 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
   }
 
   if (!user.emergencyContact) {
-    console.warn(
-      `⚠️ User ${userId} has no emergency contact — cannot trigger automatic SOS`,
-    );
+    console.warn(`⚠️ User ${userId} has no emergency contact — cannot SOS`);
     return;
   }
 
-  // Idempotency guard — don't create a second alert if one is already active.
   const existingActiveAlert = await db.alertEvent.findFirst({
     where: { userId, status: { in: ["ACTIVE", "FAILED"] } },
     orderBy: { triggeredAt: "desc" },
   });
 
   if (existingActiveAlert) {
-    console.log(
-      `ℹ️ Active alert already exists for user ${userId} — skipping automatic SOS`,
-    );
+    console.log(`ℹ️ Active alert already exists for user ${userId} — skipping`);
     return;
   }
 
-  // FIX: Omit coordinates when null instead of defaulting to (0,0).
   const alert = await db.alertEvent.create({
     data: {
       userId,
-      triggerReason: "NO_RESPONSE_AFTER_3_REMINDERS",
+      // UPDATED: reflects new 5-reminder threshold
+      triggerReason: "NO_RESPONSE_AFTER_5_REMINDERS",
       triggeredAt: new Date(),
       status: "ACTIVE",
       ...(user.lastLat != null && { latAtTrigger: user.lastLat }),
@@ -149,7 +121,6 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
 
   console.log(`🚨 Automatic SOS created for user ${userId}: ${alert.id}`);
 
-  // FIX: go through alertQueue for deduplication, retry, and consistent behavior.
   await alertQueue.add(
     "sendEmergencyAlert",
     {
@@ -168,11 +139,10 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
     },
   );
 
-  // Restart the 24h cycle immediately so the user isn't forgotten.
   await scheduleCheckIn(userId);
 }
 
-// ─── CHECK-IN WORKER ─────────────────────────────────────────────────────────
+// ─── WORKER ──────────────────────────────────────────────────────────────────
 
 if (connection) {
   new Worker(
@@ -210,7 +180,7 @@ if (connection) {
           return;
         }
 
-        // On retry attempts, stop if the user already responded.
+        // On reminder attempts (2+), stop if the user already responded.
         if (attempt > 1) {
           const unanswered = await db.checkInEvent.findFirst({
             where: { userId, response: null },
@@ -218,9 +188,7 @@ if (connection) {
           });
 
           if (!unanswered) {
-            console.log(
-              `✅ User ${userId} already responded — stopping reminders`,
-            );
+            console.log(`✅ User ${userId} already responded — stopping`);
             return;
           }
         }
@@ -236,44 +204,47 @@ if (connection) {
         await sendCheckInNotification(userId, checkIn.id);
 
         console.log(
-          `🔔 Check-in notification sent to user ${userId}, attempt ${attempt}/${MAX_REMINDERS}`,
+          `🔔 Check-in notification sent to ${userId}, attempt ${attempt}/${MAX_REMINDERS}`,
         );
 
+        // ── Schedule next reminder or SOS ─────────────────────────────────
         if (attempt < MAX_REMINDERS) {
-          // Schedule the next reminder.
           const reminderJob = await checkInQueue.getJob(
             `checkin-reminder-${userId}`,
           );
           await reminderJob?.remove();
 
+          // CHANGED: was TEN_MINUTES, now FIVE_MINUTES
           await checkInQueue.add(
             "send-check-in",
             { userId, attempt: attempt + 1 },
             {
               jobId: `checkin-reminder-${userId}`,
-              delay: TEN_MINUTES,
+              delay: FIVE_MINUTES,
               removeOnComplete: true,
             },
           );
 
           console.log(
-            `⏳ Reminder ${attempt + 1}/${MAX_REMINDERS} scheduled in 10 min for user ${userId}`,
+            `⏳ Reminder ${attempt + 1}/${MAX_REMINDERS} in 5 min for user ${userId}`,
           );
           return;
         }
 
-        // All reminders exhausted — schedule the automatic SOS.
+        // All 5 reminders exhausted — wait one more cycle then SOS.
         await checkInQueue.add(
           "auto-sos",
           { userId, checkInId: checkIn.id },
           {
             jobId: `auto-sos-${userId}`,
-            delay: TEN_MINUTES,
+            delay: FIVE_MINUTES,
             removeOnComplete: true,
           },
         );
 
-        console.log(`🚨 Auto SOS scheduled in 10 min for user ${userId}`);
+        console.log(
+          `🚨 Auto SOS scheduled in 5 min for user ${userId} (5 reminders exhausted)`,
+        );
         return;
       }
 
@@ -292,11 +263,6 @@ if (connection) {
 }
 
 // ─── HANDLE USER RESPONSE ────────────────────────────────────────────────────
-// Called when the user taps "I'm ok" or "Need help" in the app.
-//
-// FIX (magic string IDs): The old code checked `checkInId === "manual"` to skip
-// the DB update. Now the caller passes `source: "scheduled" | "manual"` and we
-// check that field instead — explicit and type-safe.
 
 export async function handleUserResponse(
   userId: string,
@@ -309,7 +275,6 @@ export async function handleUserResponse(
     return;
   }
 
-  // Cancel all pending jobs for this user.
   const [mainJob, reminderJob, autoSosJob] = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
     checkInQueue.getJob(`checkin-reminder-${userId}`),
@@ -321,7 +286,6 @@ export async function handleUserResponse(
     autoSosJob?.remove(),
   ]);
 
-  // FIX: use explicit `source` flag instead of magic string comparison.
   if (source === "scheduled") {
     await db.checkInEvent.update({
       where: { id: checkInId },
@@ -334,7 +298,6 @@ export async function handleUserResponse(
       where: { id: userId },
       data: { lastCheckInAt: new Date(), status: "ACTIVE" },
     });
-
     await scheduleCheckIn(userId);
     return;
   }
@@ -346,13 +309,10 @@ export async function handleUserResponse(
     });
 
     if (!user || !user.emergencyContact) {
-      console.warn(
-        `⚠️ Cannot trigger SOS for user ${userId} — missing user or contact`,
-      );
+      console.warn(`⚠️ Cannot SOS for ${userId} — missing user or contact`);
       return;
     }
 
-    // FIX: Omit coordinates when null instead of defaulting to (0,0).
     const alert = await db.alertEvent.create({
       data: {
         userId,
@@ -364,7 +324,6 @@ export async function handleUserResponse(
       },
     });
 
-    // FIX: go through alertQueue (retry, deduplication, consistent behavior).
     await alertQueue.add(
       "sendEmergencyAlert",
       {

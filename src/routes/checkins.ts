@@ -1,59 +1,33 @@
 // ─── src/routes/checkins.ts ───────────────────────────────────────────────────
-// Check-in response routes.
-//
-// IMPROVEMENT: The `handleUserResponse` call now passes a `source` field
-// ("scheduled" | "manual") instead of relying on magic string IDs like
-// checkInId === "manual". The caller decides the source explicitly.
+// SECURITY: Input now validated via checkInResponseSchema (Zod).
+// Uses z.enum(["OK","SOS"]) — invalid values rejected at schema level.
 
 import { Router } from "express";
 import type { Request, Response } from "express";
+import { ZodError } from "zod";
 import { db } from "../db/client.js";
 import { handleUserResponse } from "../jobs/checkin-scheduler.js";
+import { checkInResponseSchema } from "../validators/schemas.js";
 
 export const checkInRouter = Router();
 
 // POST /checkins/respond
-// Called when the user taps "I'm ok" or "Need help" on the notification.
 checkInRouter.post("/respond", async (req: Request, res: Response) => {
   try {
-    const { userId, checkInId, response, source } = req.body as {
-      userId?: string;
-      checkInId?: string;
-      response?: string;
-      // FIX: explicit source field instead of magic string checkInId comparison.
-      // Clients should send "scheduled" when responding to a push notification,
-      // or "manual" when the user manually triggers from within the app.
-      source?: "scheduled" | "manual";
-    };
+    const parsed = checkInResponseSchema.parse(req.body);
+    const { userId, checkInId, response, source } = parsed;
 
-    if (!userId) {
-      return res.status(400).json({ error: "Missing userId" });
-    }
-
-    if (!checkInId) {
-      return res.status(400).json({ error: "Missing checkInId" });
-    }
-
-    if (!["OK", "SOS"].includes(response ?? "")) {
-      return res
-        .status(400)
-        .json({ error: "Invalid response value — must be OK or SOS" });
-    }
-
-    // Default to "scheduled" for backwards compatibility with clients that
-    // don't yet send the `source` field.
+    // Backwards-compatible source resolution:
+    // - If source is explicitly sent → use it
+    // - If checkInId is "manual" or "manual-sos" (legacy clients) → manual
+    // - Otherwise → scheduled
     const resolvedSource =
       source ??
       (checkInId === "manual" || checkInId === "manual-sos"
         ? "manual"
         : "scheduled");
 
-    await handleUserResponse(
-      userId,
-      checkInId,
-      response as "OK" | "SOS",
-      resolvedSource,
-    );
+    await handleUserResponse(userId, checkInId, response, resolvedSource);
 
     return res.json({
       ok: true,
@@ -63,6 +37,13 @@ checkInRouter.post("/respond", async (req: Request, res: Response) => {
           : "SOS alert triggered.",
     });
   } catch (err) {
+    if (err instanceof ZodError) {
+      return res.status(400).json({
+        error: "Invalid check-in payload",
+        details: err.flatten(),
+      });
+    }
+
     console.error("POST /checkins/respond error:", err);
     return res
       .status(500)
@@ -71,10 +52,14 @@ checkInRouter.post("/respond", async (req: Request, res: Response) => {
 });
 
 // GET /checkins/history/:userId
-// Powers a future "check-in history" screen.
 checkInRouter.get("/history/:userId", async (req: Request, res: Response) => {
   try {
     const userId = String(req.params.userId);
+
+    // Basic CUID format check to avoid arbitrary strings hitting the DB.
+    if (!/^c[a-z0-9]{24,}$/.test(userId)) {
+      return res.status(400).json({ error: "Invalid userId format" });
+    }
 
     const events = await db.checkInEvent.findMany({
       where: { userId },
