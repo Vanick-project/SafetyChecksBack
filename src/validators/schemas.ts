@@ -180,7 +180,7 @@ export const checkInResponseSchema = z.object({
   checkInId: checkInIdField,
   // Strict enum — only these two values are valid at the schema level.
   response: z.enum(["OK", "SOS"], {
-    errorMap: () => ({ message: "response must be OK or SOS" }),
+    error: "response must be OK or SOS",
   }),
   // Explicit source: "scheduled" = response to a push notification,
   // "manual" = user-initiated from within the app.
