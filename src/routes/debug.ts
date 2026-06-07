@@ -11,12 +11,16 @@ import { sendCheckInNotification } from "../services/fcm.js";
 
 const router = Router();
 
+// Helper — Express 5 type req.params comme string | string[] | undefined, Prisma attend string.
+function param(value: string | string[] | undefined): string {
+  if (!value) return "";
+  return Array.isArray(value) ? (value[0] ?? "") : value;
+}
+
 // POST /debug/trigger-checkin/:userId
-// Déclenche immédiatement une notification de check-in pour tester le flow
-// sans attendre 1h, 4h ou 24h.
 router.post("/trigger-checkin/:userId", async (req: Request, res: Response) => {
   try {
-    const { userId } = req.params;
+    const userId = param(req.params.userId);
 
     if (!userId) {
       return res.status(400).json({ error: "Missing userId" });
@@ -38,7 +42,6 @@ router.post("/trigger-checkin/:userId", async (req: Request, res: Response) => {
       });
     }
 
-    // Crée un événement de check-in et envoie la notification immédiatement.
     const checkIn = await db.checkInEvent.create({
       data: {
         userId,
@@ -65,11 +68,9 @@ router.post("/trigger-checkin/:userId", async (req: Request, res: Response) => {
 });
 
 // POST /debug/reschedule/:userId
-// Reprogramme le prochain check-in à 30 secondes pour tester le cycle complet
-// (notification → pas de réponse → rappels → SOS automatique).
 router.post("/reschedule/:userId", async (req: Request, res: Response) => {
   try {
-    const { userId } = req.params;
+    const userId = param(req.params.userId);
     const { delaySeconds = 30 } = req.body as { delaySeconds?: number };
 
     if (!checkInQueue) {
@@ -85,7 +86,6 @@ router.post("/reschedule/:userId", async (req: Request, res: Response) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    // Supprime les jobs existants.
     const [mainJob, reminderJob, autoSosJob] = await Promise.all([
       checkInQueue.getJob(`checkin-${userId}`),
       checkInQueue.getJob(`checkin-reminder-${userId}`),
@@ -97,7 +97,6 @@ router.post("/reschedule/:userId", async (req: Request, res: Response) => {
       autoSosJob?.remove(),
     ]);
 
-    // Reprogramme avec le délai custom (en secondes).
     await checkInQueue.add(
       "send-check-in",
       { userId, attempt: 1 },
@@ -124,10 +123,9 @@ router.post("/reschedule/:userId", async (req: Request, res: Response) => {
 });
 
 // GET /debug/queue-status/:userId
-// Affiche l'état des jobs BullMQ pour un utilisateur.
 router.get("/queue-status/:userId", async (req: Request, res: Response) => {
   try {
-    const { userId } = req.params;
+    const userId = param(req.params.userId);
 
     if (!checkInQueue) {
       return res.status(503).json({ error: "Check-in queue unavailable" });
