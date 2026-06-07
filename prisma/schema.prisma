@@ -7,7 +7,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  
 }
 
 // ─── USERS ───────────────────────────────────────────────────────────────────
@@ -121,4 +121,5 @@ model AlertAction {
   alert AlertEvent @relation(fields: [alertId], references: [id], onDelete: Cascade)
 
   @@index([alertId])
+}              // ← cette accolade manque probablement
 
