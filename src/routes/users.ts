@@ -16,6 +16,7 @@ import { scheduleCheckIn } from "../jobs/checkin-scheduler.js";
 const router = Router();
 
 // POST /users/register
+// Inclut maintenant checkInIntervalHours choisi pendant l'onboarding
 router.post("/register", async (req: Request, res: Response) => {
   try {
     const parsed = registerUserSchema.parse(req.body);
@@ -27,12 +28,28 @@ router.post("/register", async (req: Request, res: Response) => {
       country,
       zipCode,
       emergencyContact,
+      checkInIntervalHours,
     } = parsed;
 
     const user = await db.user.upsert({
       where: { phoneNumber },
-      update: { firstName, address, city, country, zipCode },
-      create: { phoneNumber, firstName, address, city, country, zipCode },
+      update: {
+        firstName,
+        address,
+        city,
+        country,
+        zipCode,
+        checkInIntervalHours,
+      },
+      create: {
+        phoneNumber,
+        firstName,
+        address,
+        city,
+        country,
+        zipCode,
+        checkInIntervalHours,
+      },
     });
 
     await db.emergencyContact.upsert({
@@ -52,7 +69,7 @@ router.post("/register", async (req: Request, res: Response) => {
 
     await scheduleCheckIn(user.id);
 
-    return res.status(201).json({ userId: user.id });
+    return res.status(201).json({ userId: user.id, checkInIntervalHours });
   } catch (err: any) {
     if (err instanceof ZodError) {
       return res
@@ -100,11 +117,7 @@ router.patch("/fcm-token", async (req: Request, res: Response) => {
     const parsed = updateFcmTokenSchema.parse(req.body);
     const { userId, token } = parsed;
 
-    await db.user.update({
-      where: { id: userId },
-      data: { fcmToken: token },
-    });
-
+    await db.user.update({ where: { id: userId }, data: { fcmToken: token } });
     return res.json({ ok: true });
   } catch (err: any) {
     if (err instanceof ZodError) {
@@ -127,7 +140,6 @@ router.patch("/location", async (req: Request, res: Response) => {
       where: { id: userId },
       data: { lastLat: lat, lastLng: lng },
     });
-
     return res.json({ ok: true });
   } catch (err: any) {
     if (err instanceof ZodError) {
@@ -141,8 +153,8 @@ router.patch("/location", async (req: Request, res: Response) => {
 });
 
 // PATCH /users/checkin-interval
-// NOUVEAU — l'utilisateur choisit son intervalle de check-in (1/2/4/8/12/24h).
-// On sauvegarde l'intervalle en base et on reprogramme le prochain check-in.
+// FIX: le schema accepte maintenant string ET number → plus de 400
+// Reprogramme le job BullMQ + réinitialise le timer (lastCheckInAt = now)
 router.patch("/checkin-interval", async (req: Request, res: Response) => {
   try {
     const parsed = updateCheckInIntervalSchema.parse(req.body);
@@ -151,20 +163,28 @@ router.patch("/checkin-interval", async (req: Request, res: Response) => {
     const user = await db.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    // Sauvegarde l'intervalle en base (champ checkInIntervalHours sur le modèle User).
+    // Sauvegarde le nouvel intervalle ET réinitialise lastCheckInAt à maintenant
+    // → le countdown repart de zéro avec le nouvel intervalle
     await db.user.update({
       where: { id: userId },
-      data: { checkInIntervalHours: intervalHours },
+      data: {
+        checkInIntervalHours: intervalHours,
+        lastCheckInAt: new Date(), // réinitialise le timer visuellement
+      },
     });
 
-    // Reprogramme immédiatement le prochain check-in avec le nouvel intervalle.
+    // Reprogramme le job BullMQ avec le nouvel intervalle
     await scheduleCheckIn(userId);
 
     console.log(
-      `⏰ Check-in interval updated for user ${userId}: ${intervalHours}h`,
+      `⏰ Check-in interval updated to ${intervalHours}h for user ${userId} — timer reset`,
     );
 
-    return res.json({ ok: true, intervalHours });
+    return res.json({
+      ok: true,
+      intervalHours,
+      timerResetAt: new Date().toISOString(),
+    });
   } catch (err: any) {
     if (err instanceof ZodError) {
       return res
@@ -180,14 +200,11 @@ router.patch("/checkin-interval", async (req: Request, res: Response) => {
 router.get("/:id", async (req: Request, res: Response) => {
   try {
     const userId = String(req.params.id);
-
     const user = await db.user.findUnique({
       where: { id: userId },
       include: { emergencyContact: true },
     });
-
     if (!user) return res.status(404).json({ error: "User not found" });
-
     return res.json(user);
   } catch (err) {
     console.error("GET /users/:id error:", err);

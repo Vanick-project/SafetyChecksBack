@@ -1,5 +1,5 @@
 // Safety Check — Prisma Schema
-// Run: npx prisma migrate dev --name init
+// Run: npx prisma migrate dev --name <migration_name>
 
 generator client {
   provider = "prisma-client-js"
@@ -7,28 +7,28 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  
-  
+  url      = env("DATABASE_URL")
 }
 
 // ─── USERS ───────────────────────────────────────────────────────────────────
 
 model User {
-  id          String   @id @default(uuid())
-  phoneNumber String   @unique
+  id          String     @id @default(cuid())
+  phoneNumber String     @unique
   firstName   String?
   address     String
   city        String
   country     String
   zipCode     String
-  fcmToken    String?           // Firebase push token, updated on login
-  lastLat     Float?            // Updated every ~15 min by background sync
+  fcmToken    String?                    // Firebase push token, updated on login
+  lastLat     Float?                     // Updated every ~15 min by background sync
   lastLng     Float?
   status      UserStatus @default(ACTIVE)
-  checkInIntervalHours Int       @default(24)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  checkInIntervalHours Int @default(24) // 6 | 12 | 24 — choisi à l'inscription
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
   lastCheckInAt DateTime?
+
   emergencyContact EmergencyContact?
   checkInEvents    CheckInEvent[]
   alertEvents      AlertEvent[]
@@ -36,14 +36,14 @@ model User {
 
 enum UserStatus {
   ACTIVE
-  PAUSED    // User temporarily disabled check-ins (e.g. on holiday)
+  PAUSED   // User temporarily disabled check-ins (e.g. on holiday)
   DELETED
 }
 
 // ─── EMERGENCY CONTACTS ──────────────────────────────────────────────────────
 
 model EmergencyContact {
-  id           String   @id @default(uuid())
+  id           String   @id @default(cuid())
   userId       String   @unique
   name         String
   phoneNumber  String
@@ -57,12 +57,12 @@ model EmergencyContact {
 // ─── CHECK-IN EVENTS ─────────────────────────────────────────────────────────
 
 model CheckInEvent {
-  id            String          @id @default(uuid())
+  id            String           @id @default(cuid())
   userId        String
-  sentAt        DateTime        @default(now())
+  sentAt        DateTime         @default(now())
   respondedAt   DateTime?
   response      CheckInResponse?
-  attemptNumber Int             @default(1)
+  attemptNumber Int              @default(1)
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -77,14 +77,14 @@ enum CheckInResponse {
 // ─── ALERT EVENTS ────────────────────────────────────────────────────────────
 
 model AlertEvent {
-  id            String      @id @default(uuid())
+  id            String      @id @default(cuid())
   userId        String
   triggerReason AlertReason
   triggeredAt   DateTime    @default(now())
   resolvedAt    DateTime?
   status        AlertStatus @default(ACTIVE)
-  latAtTrigger Float?
-  lngAtTrigger Float?
+  latAtTrigger  Float?
+  lngAtTrigger  Float?
 
   user    User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   actions AlertAction[]
@@ -95,7 +95,7 @@ model AlertEvent {
 enum AlertReason {
   NO_RESPONSE_AFTER_2_ATTEMPTS
   NO_RESPONSE_AFTER_3_REMINDERS
-  NO_RESPONSE_AFTER_5_REMINDERS 
+  NO_RESPONSE_AFTER_5_REMINDERS
   USER_PRESSED_SOS
 }
 
@@ -109,21 +109,16 @@ enum AlertStatus {
 // ─── ALERT ACTIONS (audit log) ───────────────────────────────────────────────
 
 model AlertAction {
-  id            String   @id @default(cuid())
+  id            String     @id @default(cuid())
   alertId       String
   actionType    String
-  destination   String
+  destination   String?
   outcome       String
   providerSid   String?
-  executedAt    DateTime
-  humanAnswered Boolean  @default(false)   // ← AJOUTE CETTE LIGNE
+  executedAt    DateTime   @default(now())
+  humanAnswered Boolean    @default(false)
 
-  alert         AlertEvent @relation(fields: [alertId], references: [id])
-}
+  alert AlertEvent @relation(fields: [alertId], references: [id], onDelete: Cascade)
 
-enum ActionType {
-  CALL
-  SMS
-  PUSH
-  USER_RESOLVED
-}
+  @@index([alertId])
+
