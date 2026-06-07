@@ -77,9 +77,10 @@ export const checkInResponseSchema = z.object({
 // Valeurs autorisées en heures : 1, 2, 4, 8, 12, 24.
 export const updateCheckInIntervalSchema = z.object({
   userId: cuid,
-  intervalHours: z
-    .enum(["1", "2", "4", "8", "12", "24"], {
-      error: "intervalHours must be one of: 1, 2, 4, 8, 12, 24",
-    })
-    .transform(Number),
+  intervalHours: z.union([
+    z.enum(["1", "2", "4", "8", "12", "24"]).transform(Number),
+    z.number().refine((v) => [1, 2, 4, 8, 12, 24].includes(v), {
+      message: "intervalHours must be one of: 1, 2, 4, 8, 12, 24",
+    }),
+  ]),
 });
