@@ -1,3 +1,5 @@
+// ─── src/routes/users.ts ─────────────────────────────────────────────────────
+
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { ZodError } from "zod";
@@ -7,7 +9,9 @@ import {
   updateFcmTokenSchema,
   updateLocationSchema,
   updateEmergencyContactSchema,
+  updateCheckInIntervalSchema,
 } from "../validators/schemas.js";
+import { scheduleCheckIn } from "../jobs/checkin-scheduler.js";
 
 const router = Router();
 
@@ -15,7 +19,6 @@ const router = Router();
 router.post("/register", async (req: Request, res: Response) => {
   try {
     const parsed = registerUserSchema.parse(req.body);
-
     const {
       phoneNumber,
       firstName,
@@ -28,21 +31,8 @@ router.post("/register", async (req: Request, res: Response) => {
 
     const user = await db.user.upsert({
       where: { phoneNumber },
-      update: {
-        firstName,
-        address,
-        city,
-        country,
-        zipCode,
-      },
-      create: {
-        phoneNumber,
-        firstName,
-        address,
-        city,
-        country,
-        zipCode,
-      },
+      update: { firstName, address, city, country, zipCode },
+      create: { phoneNumber, firstName, address, city, country, zipCode },
     });
 
     await db.emergencyContact.upsert({
@@ -60,15 +50,15 @@ router.post("/register", async (req: Request, res: Response) => {
       },
     });
 
+    await scheduleCheckIn(user.id);
+
     return res.status(201).json({ userId: user.id });
   } catch (err: any) {
     if (err instanceof ZodError) {
-      return res.status(400).json({
-        error: "Invalid registration data",
-        details: err.flatten(),
-      });
+      return res
+        .status(400)
+        .json({ error: "Invalid registration data", details: err.flatten() });
     }
-
     console.error("POST /users/register error:", err);
     return res.status(500).json({ error: "Registration failed" });
   }
@@ -80,41 +70,25 @@ router.patch("/emergency-contact", async (req: Request, res: Response) => {
     const parsed = updateEmergencyContactSchema.parse(req.body);
     const { userId, name, phoneNumber, relationship } = parsed;
 
-    const user = await db.user.findUnique({
-      where: { id: userId },
-    });
-
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
-    }
+    const user = await db.user.findUnique({ where: { id: userId } });
+    if (!user) return res.status(404).json({ error: "User not found" });
 
     const emergencyContact = await db.emergencyContact.upsert({
       where: { userId },
-      update: {
-        name,
-        phoneNumber,
-        relationship: relationship || null,
-      },
-      create: {
-        userId,
-        name,
-        phoneNumber,
-        relationship: relationship || null,
-      },
+      update: { name, phoneNumber, relationship: relationship || null },
+      create: { userId, name, phoneNumber, relationship: relationship || null },
     });
 
-    return res.json({
-      ok: true,
-      emergencyContact,
-    });
+    return res.json({ ok: true, emergencyContact });
   } catch (err: any) {
     if (err instanceof ZodError) {
-      return res.status(400).json({
-        error: "Invalid emergency contact payload",
-        details: err.flatten(),
-      });
+      return res
+        .status(400)
+        .json({
+          error: "Invalid emergency contact payload",
+          details: err.flatten(),
+        });
     }
-
     console.error("PATCH /users/emergency-contact error:", err);
     return res.status(500).json({ error: "Emergency contact update failed" });
   }
@@ -134,12 +108,10 @@ router.patch("/fcm-token", async (req: Request, res: Response) => {
     return res.json({ ok: true });
   } catch (err: any) {
     if (err instanceof ZodError) {
-      return res.status(400).json({
-        error: "Invalid token payload",
-        details: err.flatten(),
-      });
+      return res
+        .status(400)
+        .json({ error: "Invalid token payload", details: err.flatten() });
     }
-
     console.error("PATCH /users/fcm-token error:", err);
     return res.status(500).json({ error: "Token update failed" });
   }
@@ -159,14 +131,48 @@ router.patch("/location", async (req: Request, res: Response) => {
     return res.json({ ok: true });
   } catch (err: any) {
     if (err instanceof ZodError) {
-      return res.status(400).json({
-        error: "Invalid location payload",
-        details: err.flatten(),
-      });
+      return res
+        .status(400)
+        .json({ error: "Invalid location payload", details: err.flatten() });
     }
-
     console.error("PATCH /users/location error:", err);
     return res.status(500).json({ error: "Location update failed" });
+  }
+});
+
+// PATCH /users/checkin-interval
+// NOUVEAU — l'utilisateur choisit son intervalle de check-in (1/2/4/8/12/24h).
+// On sauvegarde l'intervalle en base et on reprogramme le prochain check-in.
+router.patch("/checkin-interval", async (req: Request, res: Response) => {
+  try {
+    const parsed = updateCheckInIntervalSchema.parse(req.body);
+    const { userId, intervalHours } = parsed;
+
+    const user = await db.user.findUnique({ where: { id: userId } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    // Sauvegarde l'intervalle en base (champ checkInIntervalHours sur le modèle User).
+    await db.user.update({
+      where: { id: userId },
+      data: { checkInIntervalHours: intervalHours },
+    });
+
+    // Reprogramme immédiatement le prochain check-in avec le nouvel intervalle.
+    await scheduleCheckIn(userId);
+
+    console.log(
+      `⏰ Check-in interval updated for user ${userId}: ${intervalHours}h`,
+    );
+
+    return res.json({ ok: true, intervalHours });
+  } catch (err: any) {
+    if (err instanceof ZodError) {
+      return res
+        .status(400)
+        .json({ error: "Invalid interval payload", details: err.flatten() });
+    }
+    console.error("PATCH /users/checkin-interval error:", err);
+    return res.status(500).json({ error: "Interval update failed" });
   }
 });
 
@@ -180,9 +186,7 @@ router.get("/:id", async (req: Request, res: Response) => {
       include: { emergencyContact: true },
     });
 
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
-    }
+    if (!user) return res.status(404).json({ error: "User not found" });
 
     return res.json(user);
   } catch (err) {

@@ -1,22 +1,16 @@
 // ─── src/jobs/checkin-scheduler.ts ───────────────────────────────────────────
-// Check-in cycle: 24h → 5 notifications every 5 min → automatic SOS.
-//
-// CHANGES vs previous version:
-//   - TEN_MINUTES replaced by FIVE_MINUTES (5 reminders × 5 min = 25 min window)
-//   - MAX_REMINDERS: 3 → 5
-//   - triggerReason updated to "NO_RESPONSE_AFTER_5_REMINDERS"
-//   - All other logic (queue bypass fix, null coords, source field) unchanged.
+// CHANGEMENTS vs version précédente :
+//   - scheduleCheckIn lit checkInIntervalHours depuis la DB au lieu d'utiliser
+//     TWENTY_FOUR_HOURS fixe. Défaut : 24h si non configuré.
+//   - FIVE_MINUTES entre les rappels, MAX_REMINDERS = 5 (inchangé).
+//   - triggerReason mis à jour → NO_RESPONSE_AFTER_5_REMINDERS.
 
 import { Queue, Worker, Job } from "bullmq";
 import { Redis } from "ioredis";
 import { sendCheckInNotification } from "../services/fcm.js";
 import { db } from "../db/client.js";
 import { alertQueue } from "./alertQueue.js";
-import {
-  TWENTY_FOUR_HOURS,
-  FIVE_MINUTES,
-  MAX_REMINDERS,
-} from "../config/constants.js";
+import { FIVE_MINUTES, MAX_REMINDERS } from "../config/constants.js";
 
 // ─── REDIS ───────────────────────────────────────────────────────────────────
 
@@ -38,6 +32,22 @@ export const checkInQueue: Queue | null = connection
   ? new Queue("check-in", { connection })
   : null;
 
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+/**
+ * Retourne l'intervalle de check-in de l'utilisateur en millisecondes.
+ * Lit checkInIntervalHours depuis la DB. Défaut : 24h.
+ */
+async function getUserIntervalMs(userId: string): Promise<number> {
+  const user = await db.user.findUnique({
+    where: { id: userId },
+    select: { checkInIntervalHours: true },
+  });
+
+  const hours = user?.checkInIntervalHours ?? 24;
+  return hours * 60 * 60 * 1000;
+}
+
 // ─── SCHEDULE ────────────────────────────────────────────────────────────────
 
 export async function scheduleCheckIn(userId: string) {
@@ -46,23 +56,28 @@ export async function scheduleCheckIn(userId: string) {
     return;
   }
 
+  // Annule tous les jobs existants pour cet utilisateur.
   const [mainJob, reminderJob] = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
     checkInQueue.getJob(`checkin-reminder-${userId}`),
   ]);
   await Promise.all([mainJob?.remove(), reminderJob?.remove()]);
 
+  // Lit l'intervalle personnalisé de l'utilisateur depuis la DB.
+  const intervalMs = await getUserIntervalMs(userId);
+  const intervalHours = intervalMs / (60 * 60 * 1000);
+
   await checkInQueue.add(
     "send-check-in",
     { userId, attempt: 1 },
     {
       jobId: `checkin-${userId}`,
-      delay: TWENTY_FOUR_HOURS,
+      delay: intervalMs,
       removeOnComplete: true,
     },
   );
 
-  console.log(`⏰ Check-in scheduled in 24h for user ${userId}`);
+  console.log(`⏰ Check-in scheduled in ${intervalHours}h for user ${userId}`);
 }
 
 export async function rescheduleAfterOk(userId: string) {
@@ -110,7 +125,6 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
   const alert = await db.alertEvent.create({
     data: {
       userId,
-      // UPDATED: reflects new 5-reminder threshold
       triggerReason: "NO_RESPONSE_AFTER_5_REMINDERS",
       triggeredAt: new Date(),
       status: "ACTIVE",
@@ -132,11 +146,7 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
       longitude: user.lastLng ?? null,
       maxCallRetries: 2,
     },
-    {
-      attempts: 1,
-      removeOnComplete: 50,
-      removeOnFail: 100,
-    },
+    { attempts: 1, removeOnComplete: 50, removeOnFail: 100 },
   );
 
   await scheduleCheckIn(userId);
@@ -153,7 +163,6 @@ if (connection) {
         return;
       }
 
-      // ── send-check-in ─────────────────────────────────────────────────────
       if (job.name === "send-check-in") {
         const { userId, attempt } = job.data as {
           userId: string;
@@ -180,13 +189,11 @@ if (connection) {
           return;
         }
 
-        // On reminder attempts (2+), stop if the user already responded.
         if (attempt > 1) {
           const unanswered = await db.checkInEvent.findFirst({
             where: { userId, response: null },
             orderBy: { sentAt: "desc" },
           });
-
           if (!unanswered) {
             console.log(`✅ User ${userId} already responded — stopping`);
             return;
@@ -194,27 +201,21 @@ if (connection) {
         }
 
         const checkIn = await db.checkInEvent.create({
-          data: {
-            userId,
-            sentAt: new Date(),
-            attemptNumber: attempt,
-          },
+          data: { userId, sentAt: new Date(), attemptNumber: attempt },
         });
 
         await sendCheckInNotification(userId, checkIn.id);
 
         console.log(
-          `🔔 Check-in notification sent to ${userId}, attempt ${attempt}/${MAX_REMINDERS}`,
+          `🔔 Check-in sent to ${userId}, attempt ${attempt}/${MAX_REMINDERS}`,
         );
 
-        // ── Schedule next reminder or SOS ─────────────────────────────────
         if (attempt < MAX_REMINDERS) {
           const reminderJob = await checkInQueue.getJob(
             `checkin-reminder-${userId}`,
           );
           await reminderJob?.remove();
 
-          // CHANGED: was TEN_MINUTES, now FIVE_MINUTES
           await checkInQueue.add(
             "send-check-in",
             { userId, attempt: attempt + 1 },
@@ -231,7 +232,6 @@ if (connection) {
           return;
         }
 
-        // All 5 reminders exhausted — wait one more cycle then SOS.
         await checkInQueue.add(
           "auto-sos",
           { userId, checkInId: checkIn.id },
@@ -242,19 +242,15 @@ if (connection) {
           },
         );
 
-        console.log(
-          `🚨 Auto SOS scheduled in 5 min for user ${userId} (5 reminders exhausted)`,
-        );
+        console.log(`🚨 Auto SOS scheduled in 5 min for user ${userId}`);
         return;
       }
 
-      // ── auto-sos ──────────────────────────────────────────────────────────
       if (job.name === "auto-sos") {
         const { userId, checkInId } = job.data as {
           userId: string;
           checkInId: string;
         };
-
         await triggerAutomaticSOS(userId, checkInId);
       }
     },
@@ -335,11 +331,7 @@ export async function handleUserResponse(
         longitude: user.lastLng ?? null,
         maxCallRetries: 2,
       },
-      {
-        attempts: 1,
-        removeOnComplete: 50,
-        removeOnFail: 100,
-      },
+      { attempts: 1, removeOnComplete: 50, removeOnFail: 100 },
     );
 
     await scheduleCheckIn(userId);
