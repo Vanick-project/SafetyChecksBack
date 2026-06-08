@@ -57,10 +57,13 @@ app.use("/twiml", twimlRouter);
 app.use("/twilio", twilioWebhookRouter);
 
 // Route debug — seulement en dev (jamais en prod)
+/*
 if (process.env.NODE_ENV !== "production") {
   app.use("/debug", debugRouter);
   console.log("🛠️ Debug routes enabled (dev mode)");
-}
+}*/
+// ✅ Temporaire — pour déboguer le FCM
+app.use("/debug", debugRouter);
 
 app.use((_req, res) => {
   res.status(404).json({ error: "Route not found" });
