@@ -57,11 +57,16 @@ export async function scheduleCheckIn(userId: string) {
   }
 
   // Annule tous les jobs existants pour cet utilisateur.
-  const [mainJob, reminderJob] = await Promise.all([
+  const jobsToCancel = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
-    checkInQueue.getJob(`checkin-reminder-${userId}`),
+    checkInQueue.getJob(`checkin-reminder-${userId}`), // legacy
+    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-2`),
+    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-3`),
+    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-4`),
+    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-5`),
+    checkInQueue.getJob(`auto-sos-${userId}`),
   ]);
-  await Promise.all([mainJob?.remove(), reminderJob?.remove()]);
+  await Promise.all(jobsToCancel.map((j) => j?.remove()));
 
   // Lit l'intervalle personnalisé de l'utilisateur depuis la DB.
   const intervalMs = await getUserIntervalMs(userId);
@@ -211,16 +216,19 @@ if (connection) {
         );
 
         if (attempt < MAX_REMINDERS) {
+          // Annule l'ancien reminder s'il existe encore
           const reminderJob = await checkInQueue.getJob(
             `checkin-reminder-${userId}`,
           );
           await reminderJob?.remove();
 
+          // jobId unique par attempt — évite le conflit BullMQ qui ignorait
+          // silencieusement le job si l'ID existait déjà
           await checkInQueue.add(
             "send-check-in",
             { userId, attempt: attempt + 1 },
             {
-              jobId: `checkin-reminder-${userId}`,
+              jobId: `checkin-reminder-${userId}-attempt-${attempt + 1}`,
               delay: FIVE_MINUTES,
               removeOnComplete: true,
             },
@@ -271,16 +279,17 @@ export async function handleUserResponse(
     return;
   }
 
-  const [mainJob, reminderJob, autoSosJob] = await Promise.all([
+  // Annule le job principal + tous les reminders possibles (attempt 2→5) + autoSos
+  const jobsToCancel = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
-    checkInQueue.getJob(`checkin-reminder-${userId}`),
+    checkInQueue.getJob(`checkin-reminder-${userId}`), // legacy
+    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-2`),
+    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-3`),
+    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-4`),
+    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-5`),
     checkInQueue.getJob(`auto-sos-${userId}`),
   ]);
-  await Promise.all([
-    mainJob?.remove(),
-    reminderJob?.remove(),
-    autoSosJob?.remove(),
-  ]);
+  await Promise.all(jobsToCancel.map((j) => j?.remove()));
 
   if (source === "scheduled") {
     await db.checkInEvent.update({
