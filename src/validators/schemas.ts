@@ -13,7 +13,8 @@ const e164Phone = z
 const cuid = z
   .string()
   .trim()
-  .regex(/^c[a-z0-9]{24,}$/, "Invalid ID format");
+  .min(10, "Invalid ID format")
+  .max(100, "Invalid ID format");
 
 const checkInIdField = z
   .string()
