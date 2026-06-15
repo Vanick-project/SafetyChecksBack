@@ -11,7 +11,7 @@ const FROM_NUMBER = process.env.TWILIO_PHONE_NUMBER!;
 
 // ─── SMS ─────────────────────────────────────────────────────────────────────
 
-export async function sendLocationSMS(alertId: string) {
+export async function sendEscalationSMS(alertId: string): Promise<void> {
   const alert = await db.alertEvent.findUnique({
     where: { id: alertId },
     include: { user: { include: { emergencyContact: true } } },
@@ -21,44 +21,80 @@ export async function sendLocationSMS(alertId: string) {
 
   const { user } = alert;
   const contact = user.emergencyContact;
-
   if (!contact) throw new Error("Emergency contact not found");
 
-  // FIX: only include a Maps link if we actually have coordinates.
-  const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
+  const userName = user.firstName ?? "your contact";
+  const contactName = contact.name;
+  const channel = (user as any).alertChannel ?? "sms"; // 'sms' | 'whatsapp' | 'both'
 
-  const locationLine = hasLocation
-    ? `Last known location:\nhttps://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}\n\n`
-    : `Location is unavailable at this time.\n\n`;
+  const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
+  const mapsLink = hasLocation
+    ? `https://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}`
+    : null;
 
   const body =
-    `SAFETY ALERT: ${user.firstName ?? "Your contact"} has not responded ` +
-    `to their Safety Check app.\n\n` +
-    locationLine +
-    `If you cannot reach them, please call emergency services.`;
+    `Hello ${contactName},\n\n` +
+    `This is SafetyCheck. We are contacting you on behalf of ${userName}. ` +
+    `We are unable to confirm whether ${userName} is safe at this time. ` +
+    `Please call 911 for a wellness check` +
+    (mapsLink
+      ? ` and review the link below for their last known location.`
+      : `.`) +
+    `\n\nThank you.\n\n` +
+    `---\n\n` +
+    `Bonjour ${contactName},\n\n` +
+    `Ceci est SafetyCheck. Nous vous contactons au nom de ${userName}. ` +
+    `Nous ne sommes pas en mesure de confirmer si ${userName} est en sécurité. ` +
+    `Veuillez appeler le 911 pour une vérification de bien-être` +
+    (mapsLink
+      ? ` et consultez le lien ci-dessous pour sa dernière position connue.`
+      : `.`) +
+    `\n\nMerci.` +
+    (mapsLink ? `\n\n📍 ${mapsLink}` : "");
 
-  const message = await client.messages.create({
-    body,
-    from: FROM_NUMBER,
-    to: contact.phoneNumber,
-    // FIX: was `/twiml/sms-status` (simplified handler with no business logic).
-    // Now correctly points to `/twilio/sms-status` in twilio-webhook.ts.
-    statusCallback: `${process.env.API_BASE_URL}/twilio/sms-status`,
-  });
+  const sendSMS = async () => {
+    const message = await client.messages.create({
+      body,
+      from: process.env.TWILIO_PHONE_NUMBER!,
+      to: contact.phoneNumber,
+      statusCallback: `${process.env.API_BASE_URL}/twilio/sms-status`,
+    });
+    await db.alertAction.create({
+      data: {
+        alertId,
+        actionType: "SMS",
+        destination: contact.phoneNumber,
+        outcome: `escalation_sms:${message.sid}`,
+        executedAt: new Date(),
+      },
+    });
+    console.log(`📱 Escalation SMS sent for alert ${alertId} → ${message.sid}`);
+  };
 
-  await db.alertAction.create({
-    data: {
-      alertId,
-      actionType: "SMS",
-      destination: contact.phoneNumber,
-      outcome: message.status,
-      providerSid: message.sid,
-      executedAt: new Date(),
-    },
-  });
+  const sendWhatsApp = async () => {
+    const message = await client.messages.create({
+      body,
+      from: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER ?? process.env.TWILIO_PHONE_NUMBER}`,
+      to: `whatsapp:${contact.phoneNumber}`,
+      statusCallback: `${process.env.API_BASE_URL}/twilio/sms-status`,
+    });
+    await db.alertAction.create({
+      data: {
+        alertId,
+        actionType: "SMS",
+        destination: contact.phoneNumber,
+        outcome: `escalation_whatsapp:${message.sid}`,
+        executedAt: new Date(),
+      },
+    });
+    console.log(
+      `💬 Escalation WhatsApp sent for alert ${alertId} → ${message.sid}`,
+    );
+  };
 
-  console.log(`📩 SMS sent for alert ${alertId} → SID ${message.sid}`);
-  return message.sid;
+  if (channel === "sms") await sendSMS();
+  else if (channel === "whatsapp") await sendWhatsApp();
+  else if (channel === "both") await Promise.all([sendSMS(), sendWhatsApp()]);
 }
 
 // ─── VOICE CALL ──────────────────────────────────────────────────────────────

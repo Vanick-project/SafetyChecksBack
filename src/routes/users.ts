@@ -10,6 +10,7 @@ import {
   updateLocationSchema,
   updateEmergencyContactSchema,
   updateCheckInIntervalSchema,
+  updateAlertSettingsSchema,
 } from "../validators/schemas.js";
 import { scheduleCheckIn } from "../jobs/checkin-scheduler.js";
 
@@ -99,12 +100,10 @@ router.patch("/emergency-contact", async (req: Request, res: Response) => {
     return res.json({ ok: true, emergencyContact });
   } catch (err: any) {
     if (err instanceof ZodError) {
-      return res
-        .status(400)
-        .json({
-          error: "Invalid emergency contact payload",
-          details: err.flatten(),
-        });
+      return res.status(400).json({
+        error: "Invalid emergency contact payload",
+        details: err.flatten(),
+      });
     }
     console.error("PATCH /users/emergency-contact error:", err);
     return res.status(500).json({ error: "Emergency contact update failed" });
@@ -209,6 +208,36 @@ router.get("/:id", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("GET /users/:id error:", err);
     return res.status(500).json({ error: "Fetch failed" });
+  }
+});
+
+// PATCH /users/alert-settings
+router.patch("/alert-settings", async (req: Request, res: Response) => {
+  try {
+    const parsed = updateAlertSettingsSchema.parse(req.body);
+    const { userId, alertChannel, alertSystemEnabled } = parsed;
+
+    const user = await db.user.findUnique({ where: { id: userId } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    await db.user.update({
+      where: { id: userId },
+      data: {
+        ...(alertChannel !== undefined && { alertChannel }),
+        ...(alertSystemEnabled !== undefined && { alertSystemEnabled }),
+      },
+    });
+
+    return res.json({ ok: true, alertChannel, alertSystemEnabled });
+  } catch (err: any) {
+    if (err instanceof ZodError) {
+      return res.status(400).json({
+        error: "Invalid alert settings payload",
+        details: err.flatten(),
+      });
+    }
+    console.error("PATCH /users/alert-settings error:", err);
+    return res.status(500).json({ error: "Alert settings update failed" });
   }
 });
 

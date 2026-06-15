@@ -32,6 +32,8 @@ model User {
   emergencyContact EmergencyContact?
   checkInEvents    CheckInEvent[]
   alertEvents      AlertEvent[]
+  alertChannel        String   @default("sms")   // "sms" | "whatsapp" | "both"
+  alertSystemEnabled  Boolean  @default(true)
 }
 
 enum UserStatus {

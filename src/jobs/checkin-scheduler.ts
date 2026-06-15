@@ -117,6 +117,20 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
     return;
   }
 
+  // NOUVEAU — système désactivé par l'utilisateur
+  if (user.alertSystemEnabled === false) {
+    console.log(
+      `⏸️ Alert system disabled for user ${userId} — skipping auto SOS`,
+    );
+    await scheduleCheckIn(userId);
+    return;
+  }
+
+  if (!user.emergencyContact) {
+    console.warn(`⚠️ User ${userId} has no emergency contact — cannot SOS`);
+    return;
+  }
+
   const existingActiveAlert = await db.alertEvent.findFirst({
     where: { userId, status: { in: ["ACTIVE", "FAILED"] } },
     orderBy: { triggeredAt: "desc" },

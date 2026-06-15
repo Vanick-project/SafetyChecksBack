@@ -95,3 +95,9 @@ export const updateCheckInIntervalSchema = z.object({
     }),
   ]),
 });
+
+export const updateAlertSettingsSchema = z.object({
+  userId: z.string().trim().min(10).max(100),
+  alertChannel: z.enum(["sms", "whatsapp", "both"]).optional(),
+  alertSystemEnabled: z.boolean().optional(),
+});
