@@ -30,6 +30,7 @@ router.post("/register", async (req: Request, res: Response) => {
       zipCode,
       emergencyContact,
       checkInIntervalHours,
+      language,
     } = parsed;
 
     const user = await db.user.upsert({
