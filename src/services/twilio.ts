@@ -97,6 +97,52 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
   else if (channel === "both") await Promise.all([sendSMS(), sendWhatsApp()]);
 }
 
+// ─── SMS DE POSITION (déclenché immédiatement à l'alerte) ────────────────────
+export async function sendLocationSMS(alertId: string): Promise<string> {
+  const alert = await db.alertEvent.findUnique({
+    where: { id: alertId },
+    include: { user: { include: { emergencyContact: true } } },
+  });
+
+  if (!alert) throw new Error("Alert not found");
+
+  const { user } = alert;
+  const contact = user.emergencyContact;
+  if (!contact) throw new Error("Emergency contact not found");
+
+  const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
+  const locationLine = hasLocation
+    ? `Last known location:\nhttps://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}\n\n`
+    : `Location is unavailable at this time.\n\n`;
+
+  const body =
+    `SAFETY ALERT: ${user.firstName ?? "Your contact"} has not responded ` +
+    `to their Safety Check app.\n\n` +
+    locationLine +
+    `If you cannot reach them, please call emergency services.`;
+
+  const message = await client.messages.create({
+    body,
+    from: FROM_NUMBER,
+    to: contact.phoneNumber,
+    statusCallback: `${process.env.API_BASE_URL}/twilio/sms-status`,
+  });
+
+  await db.alertAction.create({
+    data: {
+      alertId,
+      actionType: "SMS",
+      destination: contact.phoneNumber,
+      outcome: message.status,
+      providerSid: message.sid,
+      executedAt: new Date(),
+    },
+  });
+
+  console.log(`📩 SMS sent for alert ${alertId} → SID ${message.sid}`);
+  return message.sid;
+}
+
 // ─── VOICE CALL ──────────────────────────────────────────────────────────────
 
 export async function callEmergencyContact(alertId: string) {

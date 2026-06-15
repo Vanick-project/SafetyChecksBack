@@ -12,7 +12,11 @@
 
 import { Worker } from "bullmq";
 import { redisConnection } from "../lib/redis.js";
-import { sendLocationSMS, callEmergencyContact } from "../services/twilio.js";
+import {
+  sendLocationSMS,
+  sendEscalationSMS,
+  callEmergencyContact,
+} from "../services/twilio.js";
 import { db } from "../db/client.js";
 import { MAX_CALL_ATTEMPTS } from "../config/constants.js";
 
