@@ -147,6 +147,19 @@ async function handle911Escalation(alertId: string) {
 // ─── RETRY HELPER ─────────────────────────────────────────────────────────────
 
 async function scheduleCallRetry(alertId: string, currentAttemptCount: number) {
+  // NOUVEAU — vérifie que l'alerte n'a pas été résolue entre-temps
+  const alert = await db.alertEvent.findUnique({
+    where: { id: alertId },
+    select: { status: true },
+  });
+
+  if (!alert || alert.status === "RESOLVED") {
+    console.log(
+      `✅ Alert ${alertId} is RESOLVED — skipping retry and escalation`,
+    );
+    return;
+  }
+
   if (currentAttemptCount < MAX_CALL_ATTEMPTS) {
     console.log(
       `🔁 Scheduling retry for alert ${alertId}. ` +

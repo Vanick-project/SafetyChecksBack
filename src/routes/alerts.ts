@@ -49,7 +49,7 @@ alertRouter.post("/resolve", async (req: Request, res: Response) => {
       return res.status(404).json({ error: "Alert not found" });
     }
 
-    // 1. resolve alert
+    // 1. Résout l'alerte en DB EN PREMIER — le webhook vérifiera ce statut
     await db.alertEvent.update({
       where: { id: alertId },
       data: {
@@ -66,7 +66,31 @@ alertRouter.post("/resolve", async (req: Request, res: Response) => {
       },
     });
 
-    // 2. reset user state (IMPORTANT)
+    // 2. Annule tous les jobs BullMQ liés à cette alerte
+    // (sendEmergencyAlert en attente + retryEmergencyCall planifiés)
+    try {
+      const jobs = await alertQueue.getJobs(["delayed", "waiting", "active"]);
+
+      const alertJobs = jobs.filter(
+        (j) =>
+          j.data?.alertId === alertId &&
+          ["sendEmergencyAlert", "retryEmergencyCall"].includes(j.name),
+      );
+
+      await Promise.all(alertJobs.map((j) => j.remove()));
+
+      console.log(
+        `🛑 Cancelled ${alertJobs.length} BullMQ job(s) for alert ${alertId}`,
+      );
+    } catch (cancelErr) {
+      // Non-bloquant — la vérification dans le webhook prend le relais
+      console.warn(
+        `⚠️ Could not cancel BullMQ jobs for alert ${alertId}:`,
+        cancelErr,
+      );
+    }
+
+    // 3. Reset user state
     await db.user.update({
       where: { id: existingAlert.userId },
       data: {
@@ -75,7 +99,7 @@ alertRouter.post("/resolve", async (req: Request, res: Response) => {
       },
     });
 
-    // 3. relancer le cycle 24h
+    // 4. Relance le cycle de check-in
     await scheduleCheckIn(existingAlert.userId);
 
     return res.json({ ok: true });
@@ -86,7 +110,6 @@ alertRouter.post("/resolve", async (req: Request, res: Response) => {
         details: err.flatten(),
       });
     }
-
     console.error("POST /alerts/resolve error:", err);
     return res.status(500).json({ error: "Resolve failed" });
   }
