@@ -56,8 +56,7 @@ export const alertWorker = new Worker(
         where: {
           alertId,
           actionType: "CALL",
-          // FIX: exclude the simulated 911 entry from the real-call count.
-          destination: { not: "911" },
+          destination: { notIn: ["911", "escalation"] },
         },
       });
 
@@ -83,12 +82,12 @@ export const alertWorker = new Worker(
     if (job.name === "retryEmergencyCall") {
       const { alertId } = job.data as { alertId: string };
 
-      // FIX: exclude simulated 911 from the count, same as twilio-webhook.ts.
+      // Dans retryEmergencyCall — count des tentatives
       const attemptCount = await db.alertAction.count({
         where: {
           alertId,
           actionType: "CALL",
-          destination: { not: "911" },
+          destination: { notIn: ["911", "escalation"] },
         },
       });
 

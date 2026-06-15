@@ -1,14 +1,7 @@
 // ─── src/routes/twilio-webhook.ts ────────────────────────────────────────────
-// ESCALADE 911 :
-//   - En dev  (ENABLE_911_ESCALATION absent ou "false") : simulation en DB
-//   - En prod (ENABLE_911_ESCALATION=true) : SMS urgent au contact d'urgence
-//     indiquant d'appeler le 911 eux-mêmes.
-//
-//   POURQUOI PAS UN VRAI APPEL AU 911 AUTOMATIQUE ?
-//   Appeler le 911 de façon automatisée sans humain en ligne est illégal
-//   dans la plupart des juridictions (Canada, USA, Europe). La bonne pratique
-//   est d'envoyer un SMS urgent au contact d'urgence avec les coordonnées GPS
-//   et de lui demander d'appeler le 911 s'il ne peut pas joindre la personne.
+// ESCALADE :
+//   Après 3 appels sans réponse → SMS bilingue au contact d'urgence
+//   (jamais au 911 directement — approche légale pour app automatisée)
 
 import { Router } from "express";
 import type { Request, Response, NextFunction } from "express";
@@ -16,6 +9,7 @@ import twilio from "twilio";
 import { db } from "../db/client.js";
 import { alertQueue } from "../jobs/alertQueue.js";
 import { MAX_CALL_ATTEMPTS, RETRY_DELAY_MS } from "../config/constants.js";
+import { sendEscalationSMS } from "../services/twilio.js";
 
 const router = Router();
 
@@ -52,102 +46,52 @@ function validateTwilioSignature(
 
 router.use(validateTwilioSignature);
 
-// ─── 911 ESCALATION ───────────────────────────────────────────────────────────
+// ─── ESCALADE ─────────────────────────────────────────────────────────────────
+// Déclenché après MAX_CALL_ATTEMPTS appels sans réponse.
+// Envoie un SMS bilingue au contact d'urgence (pas au 911).
 
-async function handle911Escalation(alertId: string) {
-  // Idempotent — ne jamais escalader deux fois.
+async function handleEscalation(alertId: string) {
+  // Idempotent — ne jamais escalader deux fois
   const existing = await db.alertAction.findFirst({
-    where: { alertId, actionType: "CALL", destination: "911" },
+    where: { alertId, actionType: "CALL", destination: "escalation" },
   });
-  if (existing) return;
 
-  const isProduction = process.env.ENABLE_911_ESCALATION === "true";
+  if (existing) {
+    console.log(
+      `ℹ️ Escalation already handled for alert ${alertId} — skipping`,
+    );
+    return;
+  }
 
-  if (!isProduction) {
-    // ── MODE DEV : simulation en base de données ──────────────────────────
-    await db.alertAction.create({
-      data: {
-        alertId,
-        actionType: "CALL",
-        destination: "911",
-        outcome: "simulated_911_called",
-        executedAt: new Date(),
-      },
-    });
+  try {
+    // Envoie le SMS bilingue au contact d'urgence
+    await sendEscalationSMS(alertId);
 
     await db.alertEvent.update({
       where: { id: alertId },
       data: { status: "ACTIVE" },
     });
 
-    console.log(`🚨 [DEV] Simulated 911 escalation for alert ${alertId}`);
-    return;
+    console.log(
+      `🚨 Escalation SMS sent to emergency contact for alert ${alertId}`,
+    );
+  } catch (err) {
+    console.error(
+      `❌ Escalation SMS failed for alert ${alertId}:`,
+      err instanceof Error ? err.message : err,
+    );
+
+    await db.alertEvent.update({
+      where: { id: alertId },
+      data: { status: "FAILED" },
+    });
   }
-
-  // ── MODE PROD : SMS urgent au contact d'urgence ───────────────────────────
-  // On envoie un SMS demandant au contact d'appeler le 911 lui-même.
-  // C'est la seule approche légale pour une app automatisée.
-  const alert = await db.alertEvent.findUnique({
-    where: { id: alertId },
-    include: { user: { include: { emergencyContact: true } } },
-  });
-
-  if (!alert || !alert.user.emergencyContact) {
-    console.error(`❌ Cannot escalate — no contact found for alert ${alertId}`);
-    return;
-  }
-
-  const contact = alert.user.emergencyContact;
-  const { user } = alert;
-
-  const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
-
-  const locationLine = hasLocation
-    ? `GPS: https://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}`
-    : "Location unavailable.";
-
-  const urgentBody =
-    `🚨 URGENT — ${user.firstName ?? "Your contact"} could not be reached ` +
-    `after multiple attempts.\n\n` +
-    `${locationLine}\n\n` +
-    `Please call them immediately. If you cannot reach them, ` +
-    `CALL 911 AND GIVE THEM THIS LOCATION.`;
-
-  const twilioClient = twilio(
-    process.env.TWILIO_ACCOUNT_SID!,
-    process.env.TWILIO_AUTH_TOKEN!,
-  );
-
-  const message = await twilioClient.messages.create({
-    body: urgentBody,
-    from: process.env.TWILIO_PHONE_NUMBER!,
-    to: contact.phoneNumber,
-  });
-
-  await db.alertAction.create({
-    data: {
-      alertId,
-      actionType: "CALL",
-      destination: "911",
-      outcome: `escalation_sms_sent:${message.sid}`,
-      executedAt: new Date(),
-    },
-  });
-
-  await db.alertEvent.update({
-    where: { id: alertId },
-    data: { status: "ACTIVE" },
-  });
-
-  console.log(
-    `🚨 [PROD] 911 escalation SMS sent for alert ${alertId} → SID ${message.sid}`,
-  );
 }
 
 // ─── RETRY HELPER ─────────────────────────────────────────────────────────────
 
 async function scheduleCallRetry(alertId: string, currentAttemptCount: number) {
-  // NOUVEAU — vérifie que l'alerte n'a pas été résolue entre-temps
+  // Vérifie que l'alerte n'a pas été résolue entre-temps
   const alert = await db.alertEvent.findUnique({
     where: { id: alertId },
     select: { status: true },
@@ -163,7 +107,8 @@ async function scheduleCallRetry(alertId: string, currentAttemptCount: number) {
   if (currentAttemptCount < MAX_CALL_ATTEMPTS) {
     console.log(
       `🔁 Scheduling retry for alert ${alertId}. ` +
-        `Attempt ${currentAttemptCount + 1}/${MAX_CALL_ATTEMPTS} in ${RETRY_DELAY_MS / 1000}s`,
+        `Attempt ${currentAttemptCount + 1}/${MAX_CALL_ATTEMPTS} ` +
+        `in ${RETRY_DELAY_MS / 1000}s`,
     );
 
     await alertQueue.add(
@@ -178,9 +123,10 @@ async function scheduleCallRetry(alertId: string, currentAttemptCount: number) {
     );
   } else {
     console.log(
-      `🚨 Max attempts (${MAX_CALL_ATTEMPTS}) reached for alert ${alertId}. Escalating.`,
+      `🚨 Max attempts (${MAX_CALL_ATTEMPTS}) reached for alert ${alertId}. ` +
+        `Sending escalation SMS to emergency contact.`,
     );
-    await handle911Escalation(alertId);
+    await handleEscalation(alertId);
   }
 }
 
@@ -240,11 +186,12 @@ router.post("/call-status", async (req: Request, res: Response) => {
         data: { outcome: "completed-no-human" },
       });
 
+      // Compte uniquement les vrais appels (exclut les marqueurs internes)
       const attemptCount = await db.alertAction.count({
         where: {
           alertId: action.alertId,
           actionType: "CALL",
-          destination: { not: "911" },
+          destination: { notIn: ["911", "escalation"] },
         },
       });
 
@@ -258,11 +205,12 @@ router.post("/call-status", async (req: Request, res: Response) => {
         data: { outcome: CallStatus },
       });
 
+      // Compte uniquement les vrais appels (exclut les marqueurs internes)
       const attemptCount = await db.alertAction.count({
         where: {
           alertId: action.alertId,
           actionType: "CALL",
-          destination: { not: "911" },
+          destination: { notIn: ["911", "escalation"] },
         },
       });
 

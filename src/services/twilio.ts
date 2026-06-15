@@ -9,7 +9,9 @@ const client = twilio(
 
 const FROM_NUMBER = process.env.TWILIO_PHONE_NUMBER!;
 
-// ─── SMS ─────────────────────────────────────────────────────────────────────
+// ─── SMS D'ESCALADE ───────────────────────────────────────────────────────────
+// Envoyé au contact d'urgence après MAX_CALL_ATTEMPTS appels sans réponse.
+// Canal configurable : "sms" | "whatsapp" | "both" (champ alertChannel sur User)
 
 export async function sendEscalationSMS(alertId: string): Promise<void> {
   const alert = await db.alertEvent.findUnique({
@@ -25,7 +27,7 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
 
   const userName = user.firstName ?? "your contact";
   const contactName = contact.name;
-  const channel = (user as any).alertChannel ?? "sms"; // 'sms' | 'whatsapp' | 'both'
+  const channel = (user as any).alertChannel ?? "sms";
 
   const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
   const mapsLink = hasLocation
@@ -56,39 +58,50 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
     const message = await client.messages.create({
       body,
       from: process.env.TWILIO_PHONE_NUMBER!,
-      to: contact.phoneNumber,
+      to: contact!.phoneNumber,
       statusCallback: `${process.env.API_BASE_URL}/twilio/sms-status`,
     });
+
+    // actionType "CALL" + destination "escalation" = marqueur interne
+    // pour que handleEscalation() détecte l'idempotence
     await db.alertAction.create({
       data: {
         alertId,
-        actionType: "SMS",
-        destination: contact.phoneNumber,
-        outcome: `escalation_sms:${message.sid}`,
+        actionType: "CALL",
+        destination: "escalation",
+        outcome: `escalation_sms_sent:${message.sid}`,
         executedAt: new Date(),
       },
     });
-    console.log(`📱 Escalation SMS sent for alert ${alertId} → ${message.sid}`);
+
+    console.log(
+      `📱 Escalation SMS sent to emergency contact for alert ${alertId} → ${message.sid}`,
+    );
   };
 
   const sendWhatsApp = async () => {
+    const from = `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER ?? process.env.TWILIO_PHONE_NUMBER}`;
+    const to = `whatsapp:${contact!.phoneNumber}`;
+
     const message = await client.messages.create({
       body,
-      from: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER ?? process.env.TWILIO_PHONE_NUMBER}`,
-      to: `whatsapp:${contact.phoneNumber}`,
+      from,
+      to,
       statusCallback: `${process.env.API_BASE_URL}/twilio/sms-status`,
     });
+
     await db.alertAction.create({
       data: {
         alertId,
-        actionType: "SMS",
-        destination: contact.phoneNumber,
-        outcome: `escalation_whatsapp:${message.sid}`,
+        actionType: "CALL",
+        destination: "escalation",
+        outcome: `escalation_whatsapp_sent:${message.sid}`,
         executedAt: new Date(),
       },
     });
+
     console.log(
-      `💬 Escalation WhatsApp sent for alert ${alertId} → ${message.sid}`,
+      `💬 Escalation WhatsApp sent to emergency contact for alert ${alertId} → ${message.sid}`,
     );
   };
 
@@ -97,7 +110,9 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
   else if (channel === "both") await Promise.all([sendSMS(), sendWhatsApp()]);
 }
 
-// ─── SMS DE POSITION (déclenché immédiatement à l'alerte) ────────────────────
+// ─── SMS DE POSITION ──────────────────────────────────────────────────────────
+// Envoyé immédiatement quand l'alerte se déclenche (SOS manuel ou auto).
+
 export async function sendLocationSMS(alertId: string): Promise<string> {
   const alert = await db.alertEvent.findUnique({
     where: { id: alertId },
@@ -139,7 +154,7 @@ export async function sendLocationSMS(alertId: string): Promise<string> {
     },
   });
 
-  console.log(`📩 SMS sent for alert ${alertId} → SID ${message.sid}`);
+  console.log(`📩 Location SMS sent for alert ${alertId} → SID ${message.sid}`);
   return message.sid;
 }
 
@@ -155,15 +170,15 @@ export async function callEmergencyContact(alertId: string) {
 
   const { user } = alert;
   const contact = user.emergencyContact;
-
   if (!contact) throw new Error("Emergency contact not found");
 
-  // Count only real calls (exclude the simulated 911 escalation entry).
+  // Exclut les marqueurs internes "911" (legacy) et "escalation"
+  // pour ne compter que les vrais appels au contact d'urgence
   const previousAttempts = await db.alertAction.count({
     where: {
       alertId,
       actionType: "CALL",
-      destination: { not: "911" },
+      destination: { notIn: ["911", "escalation"] },
     },
   });
 
@@ -173,9 +188,7 @@ export async function callEmergencyContact(alertId: string) {
     );
   }
 
-  // FIX: only build a Maps link if we actually have coordinates.
   const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
-
   const mapsLink = hasLocation
     ? `https://maps.google.com/?q=${alert.latAtTrigger},${alert.lngAtTrigger}`
     : "";
@@ -193,8 +206,6 @@ export async function callEmergencyContact(alertId: string) {
     timeout: 20,
     statusCallback: `${process.env.API_BASE_URL}/twilio/call-status`,
     statusCallbackMethod: "POST",
-    // Capture every lifecycle event so the webhook can track exactly where
-    // the call is and drive the retry / AMD logic correctly.
     statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
     machineDetection: "Enable",
     asyncAmd: "true",
@@ -207,7 +218,7 @@ export async function callEmergencyContact(alertId: string) {
       alertId,
       actionType: "CALL",
       destination: contact.phoneNumber,
-      outcome: call.status, // "queued" at creation — will be updated by webhook
+      outcome: call.status,
       providerSid: call.sid,
       executedAt: new Date(),
     },
@@ -222,8 +233,6 @@ export async function callEmergencyContact(alertId: string) {
 }
 
 // ─── TWIML BUILDER ───────────────────────────────────────────────────────────
-// IMPROVEMENT: <Gather action> now uses the full absolute URL so Twilio can
-// POST back correctly regardless of how it resolves relative paths.
 
 export function buildAlertTwiML(name: string, mapsLink: string): string {
   const repeatUrl = `${process.env.API_BASE_URL}/twiml/repeat`;
