@@ -36,6 +36,7 @@ export const registerUserSchema = z.object({
   country: z.string().trim().max(100).optional().default(""),
   zipCode: z.string().trim().max(20).optional().default(""),
   emergencyContact: emergencyContactSchema,
+
   // Timer de check-in choisi pendant l'onboarding (optionnel, défaut 24h)
   checkInIntervalHours: z
     .union([
@@ -46,6 +47,7 @@ export const registerUserSchema = z.object({
     ])
     .optional()
     .default(24),
+  language: z.enum(["fr", "en"]).optional().default("fr"),
 });
 
 export const updateEmergencyContactSchema = z.object({

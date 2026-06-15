@@ -28,31 +28,34 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
   const userName = user.firstName ?? "your contact";
   const contactName = contact.name;
   const channel = (user as any).alertChannel ?? "sms";
+  const language = (user as any).language ?? "fr"; // champ à ajouter (voir Fix 2)
 
   const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
   const mapsLink = hasLocation
     ? `https://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}`
     : null;
 
+  // Message selon la langue de l'utilisateur
   const body =
-    `Hello ${contactName},\n\n` +
-    `This is SafetyCheck. We are contacting you on behalf of ${userName}. ` +
-    `We are unable to confirm whether ${userName} is safe at this time. ` +
-    `Please call 911 for a wellness check` +
-    (mapsLink
-      ? ` and review the link below for their last known location.`
-      : `.`) +
-    `\n\nThank you.\n\n` +
-    `---\n\n` +
-    `Bonjour ${contactName},\n\n` +
-    `Ceci est SafetyCheck. Nous vous contactons au nom de ${userName}. ` +
-    `Nous ne sommes pas en mesure de confirmer si ${userName} est en sécurité. ` +
-    `Veuillez appeler le 911 pour une vérification de bien-être` +
-    (mapsLink
-      ? ` et consultez le lien ci-dessous pour sa dernière position connue.`
-      : `.`) +
-    `\n\nMerci.` +
-    (mapsLink ? `\n\n📍 ${mapsLink}` : "");
+    language === "en"
+      ? `Hello ${contactName},\n\n` +
+        `This is SafetyCheck. We are contacting you on behalf of ${userName}. ` +
+        `We are unable to confirm whether ${userName} is safe at this time. ` +
+        `Please call 911 for a wellness check` +
+        (mapsLink
+          ? ` and review the link below for their last known location.`
+          : `.`) +
+        `\n\nThank you.` +
+        (mapsLink ? `\n\n📍 ${mapsLink}` : "")
+      : `Bonjour ${contactName},\n\n` +
+        `Ceci est SafetyCheck. Nous vous contactons au nom de ${userName}. ` +
+        `Nous ne sommes pas en mesure de confirmer si ${userName} est en sécurité. ` +
+        `Veuillez appeler le 911 pour une vérification de bien-être` +
+        (mapsLink
+          ? ` et consultez le lien ci-dessous pour sa dernière position connue.`
+          : `.`) +
+        `\n\nMerci.` +
+        (mapsLink ? `\n\n📍 ${mapsLink}` : "");
 
   const sendSMS = async () => {
     const message = await client.messages.create({
@@ -62,14 +65,13 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
       statusCallback: `${process.env.API_BASE_URL}/twilio/sms-status`,
     });
 
-    // actionType "CALL" + destination "escalation" = marqueur interne
-    // pour que handleEscalation() détecte l'idempotence
     await db.alertAction.create({
       data: {
         alertId,
         actionType: "CALL",
         destination: "escalation",
-        outcome: `escalation_sms_sent:${message.sid}`,
+        // outcome lisible — affiché directement dans AlertScreen
+        outcome: "escalation_sms_sent",
         executedAt: new Date(),
       },
     });
@@ -95,7 +97,7 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
         alertId,
         actionType: "CALL",
         destination: "escalation",
-        outcome: `escalation_whatsapp_sent:${message.sid}`,
+        outcome: "escalation_whatsapp_sent",
         executedAt: new Date(),
       },
     });
@@ -109,7 +111,6 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
   else if (channel === "whatsapp") await sendWhatsApp();
   else if (channel === "both") await Promise.all([sendSMS(), sendWhatsApp()]);
 }
-
 // ─── SMS DE POSITION ──────────────────────────────────────────────────────────
 // Envoyé immédiatement quand l'alerte se déclenche (SOS manuel ou auto).
 

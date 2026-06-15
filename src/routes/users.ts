@@ -41,6 +41,7 @@ router.post("/register", async (req: Request, res: Response) => {
         country,
         zipCode,
         checkInIntervalHours,
+        language,
       },
       create: {
         phoneNumber,
@@ -50,6 +51,7 @@ router.post("/register", async (req: Request, res: Response) => {
         country,
         zipCode,
         checkInIntervalHours,
+        language,
       },
     });
 
@@ -192,6 +194,30 @@ router.patch("/checkin-interval", async (req: Request, res: Response) => {
     }
     console.error("PATCH /users/checkin-interval error:", err);
     return res.status(500).json({ error: "Interval update failed" });
+  }
+});
+
+// PATCH /users/language
+router.patch("/language", async (req: Request, res: Response) => {
+  try {
+    const { userId, language } = req.body as {
+      userId: string;
+      language: string;
+    };
+
+    if (!userId || !["fr", "en"].includes(language)) {
+      return res.status(400).json({ error: "Invalid payload" });
+    }
+
+    await db.user.update({
+      where: { id: userId },
+      data: { language },
+    });
+
+    return res.json({ ok: true, language });
+  } catch (err) {
+    console.error("PATCH /users/language error:", err);
+    return res.status(500).json({ error: "Language update failed" });
   }
 });
 
