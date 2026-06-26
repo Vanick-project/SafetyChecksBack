@@ -34,6 +34,7 @@ model User {
   alertEvents      AlertEvent[]
   alertChannel        String   @default("sms")   // "sms" | "whatsapp" | "both"
   alertSystemEnabled  Boolean  @default(true)
+  notificationsEnabled Boolean @default(true)
 }
 
 enum UserStatus {

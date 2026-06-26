@@ -1,3 +1,19 @@
+// ─── src/services/twilio.ts ──────────────────────────────────────────────────
+//
+// CORRECTIONS :
+//
+//   1. URL APPEL — callEmergencyContact pointait vers /twiml/alert (ancien endpoint
+//      qui n'existe plus dans twiml.ts). Maintenant pointe vers /twiml/voice
+//      avec alertId et lang en query params.
+//      /twiml/voice charge le nom et les coords depuis la DB → message personnalisé.
+//
+//   2. CALLBACKS AMD ET STATUS — asyncAmdStatusCallback pointe vers /twiml/amd-callback
+//      et statusCallback vers /twiml/call-status (dans twiml.ts),
+//      pour que les résultats AMD et le statut final soient sauvegardés en DB.
+//
+//   3. buildAlertTwiML retiré — le TwiML est maintenant construit dans twiml.ts
+//      directement depuis la DB. Plus besoin de ce helper ici.
+
 import twilio from "twilio";
 import { db } from "../db/client.js";
 import { MAX_CALL_ATTEMPTS } from "../config/constants.js";
@@ -8,10 +24,9 @@ const client = twilio(
 );
 
 const FROM_NUMBER = process.env.TWILIO_PHONE_NUMBER!;
+const BASE_URL = process.env.API_BASE_URL!;
 
 // ─── SMS D'ESCALADE ───────────────────────────────────────────────────────────
-// Envoyé au contact d'urgence après MAX_CALL_ATTEMPTS appels sans réponse.
-// Canal configurable : "sms" | "whatsapp" | "both" (champ alertChannel sur User)
 
 export async function sendEscalationSMS(alertId: string): Promise<void> {
   const alert = await db.alertEvent.findUnique({
@@ -28,41 +43,36 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
   const userName = user.firstName ?? "your contact";
   const contactName = contact.name;
   const channel = (user as any).alertChannel ?? "sms";
-  const language = (user as any).language ?? "fr"; // champ à ajouter (voir Fix 2)
+  const language = (user as any).language ?? "fr";
 
   const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
   const mapsLink = hasLocation
     ? `https://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}`
     : null;
 
-  // Message selon la langue de l'utilisateur
   const body =
     language === "en"
       ? `Hello ${contactName},\n\n` +
         `This is SafetyCheck. We are contacting you on behalf of ${userName}. ` +
         `We are unable to confirm whether ${userName} is safe at this time. ` +
         `Please call 911 for a wellness check` +
-        (mapsLink
-          ? ` and review the link below for their last known location.`
-          : `.`) +
+        (mapsLink ? ` and review the link below for their last known location.` : `.`) +
         `\n\nThank you.` +
         (mapsLink ? `\n\n📍 ${mapsLink}` : "")
       : `Bonjour ${contactName},\n\n` +
         `Ceci est SafetyCheck. Nous vous contactons au nom de ${userName}. ` +
         `Nous ne sommes pas en mesure de confirmer si ${userName} est en sécurité. ` +
         `Veuillez appeler le 911 pour une vérification de bien-être` +
-        (mapsLink
-          ? ` et consultez le lien ci-dessous pour sa dernière position connue.`
-          : `.`) +
+        (mapsLink ? ` et consultez le lien ci-dessous pour sa dernière position connue.` : `.`) +
         `\n\nMerci.` +
         (mapsLink ? `\n\n📍 ${mapsLink}` : "");
 
   const sendSMS = async () => {
     const message = await client.messages.create({
       body,
-      from: process.env.TWILIO_PHONE_NUMBER!,
+      from: FROM_NUMBER,
       to: contact!.phoneNumber,
-      statusCallback: `${process.env.API_BASE_URL}/twilio/sms-status`,
+      statusCallback: `${BASE_URL}/twilio/sms-status`,
     });
 
     await db.alertAction.create({
@@ -70,26 +80,23 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
         alertId,
         actionType: "CALL",
         destination: "escalation",
-        // outcome lisible — affiché directement dans AlertScreen
         outcome: "escalation_sms_sent",
         executedAt: new Date(),
       },
     });
 
-    console.log(
-      `📱 Escalation SMS sent to emergency contact for alert ${alertId} → ${message.sid}`,
-    );
+    console.log(`📱 Escalation SMS sent for alert ${alertId} → ${message.sid}`);
   };
 
   const sendWhatsApp = async () => {
-    const from = `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER ?? process.env.TWILIO_PHONE_NUMBER}`;
+    const from = `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER ?? FROM_NUMBER}`;
     const to = `whatsapp:${contact!.phoneNumber}`;
 
     const message = await client.messages.create({
       body,
       from,
       to,
-      statusCallback: `${process.env.API_BASE_URL}/twilio/sms-status`,
+      statusCallback: `${BASE_URL}/twilio/sms-status`,
     });
 
     await db.alertAction.create({
@@ -102,17 +109,15 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
       },
     });
 
-    console.log(
-      `💬 Escalation WhatsApp sent to emergency contact for alert ${alertId} → ${message.sid}`,
-    );
+    console.log(`💬 Escalation WhatsApp sent for alert ${alertId} → ${message.sid}`);
   };
 
   if (channel === "sms") await sendSMS();
   else if (channel === "whatsapp") await sendWhatsApp();
   else if (channel === "both") await Promise.all([sendSMS(), sendWhatsApp()]);
 }
+
 // ─── SMS DE POSITION ──────────────────────────────────────────────────────────
-// Envoyé immédiatement quand l'alerte se déclenche (SOS manuel ou auto).
 
 export async function sendLocationSMS(alertId: string): Promise<string> {
   const alert = await db.alertEvent.findUnique({
@@ -141,7 +146,7 @@ export async function sendLocationSMS(alertId: string): Promise<string> {
     body,
     from: FROM_NUMBER,
     to: contact.phoneNumber,
-    statusCallback: `${process.env.API_BASE_URL}/twilio/sms-status`,
+    statusCallback: `${BASE_URL}/twilio/sms-status`,
   });
 
   await db.alertAction.create({
@@ -173,8 +178,6 @@ export async function callEmergencyContact(alertId: string) {
   const contact = user.emergencyContact;
   if (!contact) throw new Error("Emergency contact not found");
 
-  // Exclut les marqueurs internes "911" (legacy) et "escalation"
-  // pour ne compter que les vrais appels au contact d'urgence
   const previousAttempts = await db.alertAction.count({
     where: {
       alertId,
@@ -189,28 +192,31 @@ export async function callEmergencyContact(alertId: string) {
     );
   }
 
-  const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
-  const mapsLink = hasLocation
-    ? `https://maps.google.com/?q=${alert.latAtTrigger},${alert.lngAtTrigger}`
-    : "";
-
+  // CORRECTION : URL pointe vers /twiml/voice avec alertId et lang
+  // → twiml.ts charge le nom et les coords depuis la DB
+  // → message vocal personnalisé FR ou EN selon la langue de l'utilisateur
+  const lang = (user as any).language ?? "fr";
   const twimlUrl =
-    `${process.env.API_BASE_URL}/twiml/alert` +
+    `${BASE_URL}/twiml/voice` +
     `?alertId=${encodeURIComponent(alertId)}` +
-    `&name=${encodeURIComponent(user.firstName ?? "your contact")}` +
-    `&location=${encodeURIComponent(mapsLink)}`;
+    `&lang=${encodeURIComponent(lang)}`;
 
   const call = await client.calls.create({
     url: twimlUrl,
     from: FROM_NUMBER,
     to: contact.phoneNumber,
     timeout: 20,
-    statusCallback: `${process.env.API_BASE_URL}/twilio/call-status`,
+    // CORRECTION : statusCallback → /twiml/call-status (dans twiml.ts)
+    statusCallback: `${BASE_URL}/twiml/call-status`,
     statusCallbackMethod: "POST",
     statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
-    machineDetection: "Enable",
+    // AMD = Answering Machine Detection
+    // DetectMessageEnd attend la fin du message répondeur avant de jouer le TwiML
+    // (meilleur que Enable qui coupe au milieu du message répondeur)
+    machineDetection: "DetectMessageEnd",
     asyncAmd: "true",
-    asyncAmdStatusCallback: `${process.env.API_BASE_URL}/twilio/amd-status`,
+    // CORRECTION : amdCallback → /twiml/amd-callback (dans twiml.ts)
+    asyncAmdStatusCallback: `${BASE_URL}/twiml/amd-callback`,
     asyncAmdStatusCallbackMethod: "POST",
   });
 
@@ -231,35 +237,4 @@ export async function callEmergencyContact(alertId: string) {
   );
 
   return call.sid;
-}
-
-// ─── TWIML BUILDER ───────────────────────────────────────────────────────────
-
-export function buildAlertTwiML(name: string, mapsLink: string): string {
-  const repeatUrl = `${process.env.API_BASE_URL}/twiml/repeat`;
-
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Pause length="1"/>
-  <Say voice="Polly.Joanna" language="en-US">
-    This is an automated Safety Check alert.
-    ${name} has not responded to their safety check-in and may need assistance.
-  </Say>
-  <Pause length="1"/>
-  <Say voice="Polly.Joanna" language="en-US">
-    Their last known location has been sent to you by text message.
-    Please try to contact them immediately.
-    If you cannot reach them, please call emergency services.
-  </Say>
-  <Pause length="1"/>
-  <Say voice="Polly.Joanna" language="en-US">
-    To repeat this message, press 1. Otherwise, please hang up and take action now.
-  </Say>
-  <Gather numDigits="1" action="${repeatUrl}" method="POST">
-    <Pause length="6"/>
-  </Gather>
-  <Say voice="Polly.Joanna" language="en-US">
-    Thank you. Please check on them as soon as possible. Goodbye.
-  </Say>
-</Response>`;
 }

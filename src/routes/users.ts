@@ -1,4 +1,16 @@
 // ─── src/routes/users.ts ─────────────────────────────────────────────────────
+//
+// AJOUT : PATCH /users/notifications-settings
+//   Permet à l'utilisateur d'activer/désactiver les notifications de check-in.
+//   Quand notificationsEnabled = false :
+//     - Le champ est sauvegardé en DB
+//     - checkin-scheduler.ts vérifie ce champ au début de scheduleCheckIn()
+//       et ne programme pas de nouveau job si false
+//     - Les jobs BullMQ existants sont annulés côté backend (voir checkin-scheduler)
+//
+// PRÉREQUIS SQL (à exécuter dans Railway PostgreSQL Query si pas encore fait) :
+//   ALTER TABLE "User"
+//     ADD COLUMN IF NOT EXISTS "notificationsEnabled" BOOLEAN NOT NULL DEFAULT true;
 
 import { Router } from "express";
 import type { Request, Response } from "express";
@@ -11,13 +23,13 @@ import {
   updateEmergencyContactSchema,
   updateCheckInIntervalSchema,
   updateAlertSettingsSchema,
+  updateNotificationsSettingsSchema,
 } from "../validators/schemas.js";
 import { scheduleCheckIn } from "../jobs/checkin-scheduler.js";
 
 const router = Router();
 
 // POST /users/register
-// Inclut maintenant checkInIntervalHours choisi pendant l'onboarding
 router.post("/register", async (req: Request, res: Response) => {
   try {
     const parsed = registerUserSchema.parse(req.body);
@@ -155,8 +167,6 @@ router.patch("/location", async (req: Request, res: Response) => {
 });
 
 // PATCH /users/checkin-interval
-// FIX: le schema accepte maintenant string ET number → plus de 400
-// Reprogramme le job BullMQ + réinitialise le timer (lastCheckInAt = now)
 router.patch("/checkin-interval", async (req: Request, res: Response) => {
   try {
     const parsed = updateCheckInIntervalSchema.parse(req.body);
@@ -165,22 +175,17 @@ router.patch("/checkin-interval", async (req: Request, res: Response) => {
     const user = await db.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    // Sauvegarde le nouvel intervalle ET réinitialise lastCheckInAt à maintenant
-    // → le countdown repart de zéro avec le nouvel intervalle
     await db.user.update({
       where: { id: userId },
       data: {
         checkInIntervalHours: intervalHours,
-        lastCheckInAt: new Date(), // réinitialise le timer visuellement
+        lastCheckInAt: new Date(),
       },
     });
 
-    // Reprogramme le job BullMQ avec le nouvel intervalle
     await scheduleCheckIn(userId);
 
-    console.log(
-      `⏰ Check-in interval updated to ${intervalHours}h for user ${userId} — timer reset`,
-    );
+    console.log(`⏰ Check-in interval updated to ${intervalHours}h for user ${userId}`);
 
     return res.json({
       ok: true,
@@ -265,6 +270,49 @@ router.patch("/alert-settings", async (req: Request, res: Response) => {
     }
     console.error("PATCH /users/alert-settings error:", err);
     return res.status(500).json({ error: "Alert settings update failed" });
+  }
+});
+
+// NOUVEAU — PATCH /users/notifications-settings
+// Active ou désactive les notifications de check-in pour l'utilisateur.
+// Quand notificationsEnabled = false : scheduleCheckIn() ne programme plus de job.
+router.patch("/notifications-settings", async (req: Request, res: Response) => {
+  try {
+    const parsed = updateNotificationsSettingsSchema.parse(req.body);
+    const { userId, notificationsEnabled } = parsed;
+
+    const user = await db.user.findUnique({ where: { id: userId } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    await db.user.update({
+      where: { id: userId },
+      data: { notificationsEnabled },
+    });
+
+    // Si l'utilisateur désactive les notifications, on annule aussi
+    // les jobs BullMQ en attente pour ne pas envoyer une dernière notif
+    if (!notificationsEnabled) {
+      await scheduleCheckIn(userId); // scheduleCheckIn vérifie notificationsEnabled
+      // et ne programme rien si false (voir checkin-scheduler.ts)
+    } else {
+      // Réactive le cycle de check-in
+      await scheduleCheckIn(userId);
+    }
+
+    console.log(
+      `🔔 Notifications ${notificationsEnabled ? "enabled" : "disabled"} for user ${userId}`,
+    );
+
+    return res.json({ ok: true, notificationsEnabled });
+  } catch (err: any) {
+    if (err instanceof ZodError) {
+      return res.status(400).json({
+        error: "Invalid notifications settings payload",
+        details: err.flatten(),
+      });
+    }
+    console.error("PATCH /users/notifications-settings error:", err);
+    return res.status(500).json({ error: "Notifications settings update failed" });
   }
 });
 

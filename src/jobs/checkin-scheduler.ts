@@ -1,9 +1,13 @@
 // ─── src/jobs/checkin-scheduler.ts ───────────────────────────────────────────
-// CHANGEMENTS vs version précédente :
-//   - scheduleCheckIn lit checkInIntervalHours depuis la DB au lieu d'utiliser
-//     TWENTY_FOUR_HOURS fixe. Défaut : 24h si non configuré.
-//   - FIVE_MINUTES entre les rappels, MAX_REMINDERS = 5 (inchangé).
-//   - triggerReason mis à jour → NO_RESPONSE_AFTER_5_REMINDERS.
+//
+// AJOUT : vérification de notificationsEnabled au début de scheduleCheckIn().
+//   Quand l'utilisateur désactive les notifications dans les paramètres :
+//     → notificationsEnabled = false en DB
+//     → scheduleCheckIn() annule les jobs existants et NE programme RIEN de nouveau
+//     → Aucune notification ne sera envoyée jusqu'à réactivation
+//   Quand l'utilisateur réactive :
+//     → notificationsEnabled = true
+//     → scheduleCheckIn() programme un nouveau job normalement
 
 import { Queue, Worker, Job } from "bullmq";
 import { Redis } from "ioredis";
@@ -34,16 +38,11 @@ export const checkInQueue: Queue | null = connection
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-/**
- * Retourne l'intervalle de check-in de l'utilisateur en millisecondes.
- * Lit checkInIntervalHours depuis la DB. Défaut : 24h.
- */
 async function getUserIntervalMs(userId: string): Promise<number> {
   const user = await db.user.findUnique({
     where: { id: userId },
     select: { checkInIntervalHours: true },
   });
-
   const hours = user?.checkInIntervalHours ?? 24;
   return hours * 60 * 60 * 1000;
 }
@@ -56,10 +55,10 @@ export async function scheduleCheckIn(userId: string) {
     return;
   }
 
-  // Annule tous les jobs existants pour cet utilisateur.
+  // Annule tous les jobs existants pour cet utilisateur (toujours, même si désactivé)
   const jobsToCancel = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
-    checkInQueue.getJob(`checkin-reminder-${userId}`), // legacy
+    checkInQueue.getJob(`checkin-reminder-${userId}`),
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-2`),
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-3`),
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-4`),
@@ -68,7 +67,19 @@ export async function scheduleCheckIn(userId: string) {
   ]);
   await Promise.all(jobsToCancel.map((j) => j?.remove()));
 
-  // Lit l'intervalle personnalisé de l'utilisateur depuis la DB.
+  // AJOUT : vérifie si les notifications sont activées pour cet utilisateur
+  const userPrefsRaw = await db.user.findUnique({
+  where: { id: userId },
+  });
+  const userPrefs = userPrefsRaw as typeof userPrefsRaw & { notificationsEnabled?: boolean }
+
+  // Si notificationsEnabled est false (ou null si colonne pas encore migrée),
+  // on ne programme rien — les jobs ont déjà été annulés ci-dessus.
+  if (userPrefs?.notificationsEnabled === false) {
+    console.log(`🔕 Notifications disabled for user ${userId} — check-in cycle suspended`);
+    return;
+  }
+
   const intervalMs = await getUserIntervalMs(userId);
   const intervalHours = intervalMs / (60 * 60 * 1000);
 
@@ -117,17 +128,9 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
     return;
   }
 
-  // NOUVEAU — système désactivé par l'utilisateur
   if (user.alertSystemEnabled === false) {
-    console.log(
-      `⏸️ Alert system disabled for user ${userId} — skipping auto SOS`,
-    );
+    console.log(`⏸️ Alert system disabled for user ${userId} — skipping auto SOS`);
     await scheduleCheckIn(userId);
-    return;
-  }
-
-  if (!user.emergencyContact) {
-    console.warn(`⚠️ User ${userId} has no emergency contact — cannot SOS`);
     return;
   }
 
@@ -195,11 +198,21 @@ if (connection) {
             status: true,
             lastCheckInAt: true,
             fcmToken: true,
+            notificationsEnabled: true,
           },
+          
         });
+        
+        
 
         if (!user) {
           console.error(`❌ User ${userId} not found — skipping check-in`);
+          return;
+        }
+
+        // Double-vérification dans le worker : si désactivé entre-temps
+        if (user.notificationsEnabled === false) {
+          console.log(`🔕 Notifications disabled for user ${userId} — skipping worker execution`);
           return;
         }
 
@@ -230,14 +243,9 @@ if (connection) {
         );
 
         if (attempt < MAX_REMINDERS) {
-          // Annule l'ancien reminder s'il existe encore
-          const reminderJob = await checkInQueue.getJob(
-            `checkin-reminder-${userId}`,
-          );
+          const reminderJob = await checkInQueue.getJob(`checkin-reminder-${userId}`);
           await reminderJob?.remove();
 
-          // jobId unique par attempt — évite le conflit BullMQ qui ignorait
-          // silencieusement le job si l'ID existait déjà
           await checkInQueue.add(
             "send-check-in",
             { userId, attempt: attempt + 1 },
@@ -248,9 +256,7 @@ if (connection) {
             },
           );
 
-          console.log(
-            `⏳ Reminder ${attempt + 1}/${MAX_REMINDERS} in 5 min for user ${userId}`,
-          );
+          console.log(`⏳ Reminder ${attempt + 1}/${MAX_REMINDERS} in 5 min for user ${userId}`);
           return;
         }
 
@@ -293,10 +299,9 @@ export async function handleUserResponse(
     return;
   }
 
-  // Annule le job principal + tous les reminders possibles (attempt 2→5) + autoSos
   const jobsToCancel = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
-    checkInQueue.getJob(`checkin-reminder-${userId}`), // legacy
+    checkInQueue.getJob(`checkin-reminder-${userId}`),
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-2`),
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-3`),
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-4`),
@@ -317,6 +322,7 @@ export async function handleUserResponse(
       where: { id: userId },
       data: { lastCheckInAt: new Date(), status: "ACTIVE" },
     });
+    // scheduleCheckIn vérifiera notificationsEnabled et ne programmera rien si désactivé
     await scheduleCheckIn(userId);
     return;
   }

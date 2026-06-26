@@ -1,4 +1,9 @@
 // ─── src/validators/schemas.ts ───────────────────────────────────────────────
+//
+// AJOUT : updateNotificationsSettingsSchema
+//   → Valide le payload de PATCH /users/notifications-settings
+//   → Champ notificationsEnabled (boolean) — contrôle si le cycle de check-in
+//     est actif ou suspendu pour cet utilisateur.
 
 import { z } from "zod";
 
@@ -36,8 +41,6 @@ export const registerUserSchema = z.object({
   country: z.string().trim().max(100).optional().default(""),
   zipCode: z.string().trim().max(20).optional().default(""),
   emergencyContact: emergencyContactSchema,
-
-  // Timer de check-in choisi pendant l'onboarding (optionnel, défaut 24h)
   checkInIntervalHours: z
     .union([
       z.enum(["1", "2", "4", "8", "12", "24"]).transform(Number),
@@ -86,8 +89,6 @@ export const checkInResponseSchema = z.object({
   source: z.enum(["scheduled", "manual"]).optional(),
 });
 
-// FIX: accepte string OU number pour intervalHours
-// Le frontend envoyait un number mais le schema attendait une string → 400
 export const updateCheckInIntervalSchema = z.object({
   userId: cuid,
   intervalHours: z.union([
@@ -102,4 +103,10 @@ export const updateAlertSettingsSchema = z.object({
   userId: z.string().trim().min(10).max(100),
   alertChannel: z.enum(["sms", "whatsapp", "both"]).optional(),
   alertSystemEnabled: z.boolean().optional(),
+});
+
+// NOUVEAU — contrôle les notifications de check-in (cycle actif ou suspendu)
+export const updateNotificationsSettingsSchema = z.object({
+  userId: z.string().trim().min(10).max(100),
+  notificationsEnabled: z.boolean(),
 });
