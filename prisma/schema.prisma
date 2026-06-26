@@ -1,8 +1,8 @@
 // Safety Check — Prisma Schema
-// Run: npx prisma migrate dev --name <migration_name>
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
@@ -13,33 +13,34 @@ datasource db {
 // ─── USERS ───────────────────────────────────────────────────────────────────
 
 model User {
-  id          String     @id @default(cuid())
-  phoneNumber String     @unique
-  firstName   String?
-  address     String
-  city        String
-  country     String
-  zipCode     String
-  fcmToken    String?                    // Firebase push token, updated on login
-  lastLat     Float?                     // Updated every ~15 min by background sync
-  lastLng     Float?
-  status      UserStatus @default(ACTIVE)
-  checkInIntervalHours Int @default(24) // 6 | 12 | 24 — choisi à l'inscription
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @updatedAt
-  lastCheckInAt DateTime?
-  language  String  @default("fr")
+  id                   String    @id @default(cuid())
+  phoneNumber          String    @unique
+  firstName            String?
+  address              String    @default("")
+  city                 String    @default("")
+  country              String    @default("")
+  zipCode              String    @default("")
+  fcmToken             String?
+  lastLat              Float?
+  lastLng              Float?
+  status               UserStatus @default(ACTIVE)
+  checkInIntervalHours Int       @default(24)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  lastCheckInAt        DateTime?
+  language             String    @default("fr")
+  alertChannel         String    @default("sms")
+  alertSystemEnabled   Boolean   @default(true)
+  notificationsEnabled Boolean   @default(true)
+
   emergencyContact EmergencyContact?
   checkInEvents    CheckInEvent[]
   alertEvents      AlertEvent[]
-  alertChannel        String   @default("sms")   // "sms" | "whatsapp" | "both"
-  alertSystemEnabled  Boolean  @default(true)
-  notificationsEnabled Boolean @default(true)
 }
 
 enum UserStatus {
   ACTIVE
-  PAUSED   // User temporarily disabled check-ins (e.g. on holiday)
+  PAUSED
   DELETED
 }
 
@@ -104,25 +105,27 @@ enum AlertReason {
 
 enum AlertStatus {
   ACTIVE
-  RESOLVED   // User confirmed they are safe
-  CANCELLED  // False alarm cancelled by user
+  RESOLVED
+  CANCELLED
   FAILED
 }
 
 // ─── ALERT ACTIONS (audit log) ───────────────────────────────────────────────
 
 model AlertAction {
-  id            String     @id @default(cuid())
+  id            String    @id @default(cuid())
   alertId       String
   actionType    String
   destination   String?
   outcome       String
   providerSid   String?
-  executedAt    DateTime   @default(now())
-  humanAnswered Boolean    @default(false)
+  executedAt    DateTime  @default(now())
+  humanAnswered Boolean   @default(false)
+  amdResult     String?
+  callStatus    String?
+  callDuration  Int?
 
   alert AlertEvent @relation(fields: [alertId], references: [id], onDelete: Cascade)
 
   @@index([alertId])
-}              // ← cette accolade manque probablement
-
+}
