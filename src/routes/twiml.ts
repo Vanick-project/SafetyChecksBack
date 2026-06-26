@@ -219,7 +219,9 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
         data: {
           callStatus: CallStatus ?? null,
           callDuration: CallDuration ? parseInt(CallDuration, 10) : null,
-          outcome: CallStatus ?? null,
+          // outcome est non-nullable en DB — on n'écrase pas la valeur existante
+          // si CallStatus est absent (undefined = Prisma ignore le champ)
+          ...(CallStatus !== undefined && { outcome: CallStatus }),
         },
       });
     } catch (err) {
