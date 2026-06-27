@@ -132,7 +132,7 @@ twimlRouter.get("/voice", async (req: Request, res: Response) => {
     const langAttr = twimlLang(lang);
     const speechBlocks = buildSpeechBlocks(lang, userName, hasLocation);
     const gatherUrl = alertId
-      ? `${BASE_URL}/twiml/gather?alertId=${encodeURIComponent(alertId)}&lang=${lang}`
+      ? `${BASE_URL}/twiml/gather?alertId=${encodeURIComponent(alertId)}&amp;lang=${lang}`
       : `${BASE_URL}/twiml/gather?lang=${lang}`;
 
     const thankyouMsg = lang === "fr"
