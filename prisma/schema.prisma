@@ -7,31 +7,44 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  
 }
 
 // ─── USERS ───────────────────────────────────────────────────────────────────
 
 model User {
-  id                   String    @id @default(cuid())
-  phoneNumber          String    @unique
+  id                   String     @id @default(cuid())
+  phoneNumber          String     @unique
   firstName            String?
-  address              String    @default("")
-  city                 String    @default("")
-  country              String    @default("")
-  zipCode              String    @default("")
+  address              String     @default("")
+  city                 String     @default("")
+  country              String     @default("")
+  zipCode              String     @default("")
   fcmToken             String?
   lastLat              Float?
   lastLng              Float?
   status               UserStatus @default(ACTIVE)
-  checkInIntervalHours Int       @default(24)
-  createdAt            DateTime  @default(now())
-  updatedAt            DateTime  @updatedAt
+  checkInIntervalHours Int        @default(24)   // legacy — utilisé comme fallback
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
   lastCheckInAt        DateTime?
-  language             String    @default("fr")
-  alertChannel         String    @default("sms")
-  alertSystemEnabled   Boolean   @default(true)
-  notificationsEnabled Boolean   @default(true)
+  language             String     @default("fr")
+  alertChannel         String     @default("sms")
+  alertSystemEnabled   Boolean    @default(true)
+  notificationsEnabled Boolean    @default(true)
+
+  // ── Schedule avancé ──────────────────────────────────────────────────────
+  // scheduleType : "interval" | "weekly" | "monthly"
+  scheduleType            String  @default("interval")
+  // Pour interval : durée totale = scheduleIntervalHours * 60 + scheduleIntervalMinutes
+  scheduleIntervalHours   Int     @default(24)
+  scheduleIntervalMinutes Int     @default(0)
+  // Pour weekly : jour de la semaine (0=Dim, 1=Lun, ..., 6=Sam)
+  scheduleDayOfWeek       Int?
+  // Pour monthly : jour du mois (1..31)
+  scheduleDayOfMonth      Int?
+  // Pour weekly et monthly : heure et minute du check-in
+  scheduleTimeHour        Int     @default(9)
+  scheduleTimeMinute      Int     @default(0)
 
   emergencyContact EmergencyContact?
   checkInEvents    CheckInEvent[]
@@ -113,14 +126,14 @@ enum AlertStatus {
 // ─── ALERT ACTIONS (audit log) ───────────────────────────────────────────────
 
 model AlertAction {
-  id            String    @id @default(cuid())
+  id            String   @id @default(cuid())
   alertId       String
   actionType    String
   destination   String?
   outcome       String
   providerSid   String?
-  executedAt    DateTime  @default(now())
-  humanAnswered Boolean   @default(false)
+  executedAt    DateTime @default(now())
+  humanAnswered Boolean  @default(false)
   amdResult     String?
   callStatus    String?
   callDuration  Int?
