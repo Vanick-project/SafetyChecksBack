@@ -1,13 +1,16 @@
 // ─── src/routes/twiml.ts ──────────────────────────────────────────────────────
 //
-// Remplace entièrement l'ancien twiml.ts qui importait buildAlertTwiML
-// depuis twilio.ts (fonction supprimée).
+// FIX CRITIQUE : apostrophes échappées en &apos; dans le XML TwiML.
+// Sans ça, le parseur XML de Twilio rejette le TwiML → erreur 11200 → 
+// message "We're sorry, an application error has occurred" en anglais.
 //
-// Endpoints :
-//   GET  /twiml/voice        — Message vocal principal (FR Polly.Léa / EN Polly.Joanna)
-//   POST /twiml/gather       — Gère la touche 1 (répéter) ou timeout (raccrocher)
-//   POST /twiml/amd-callback — Résultat AMD async (human/machine) → sauvegardé en DB
-//   POST /twiml/call-status  — Statut final de l'appel + durée → sauvegardé en DB
+// Règle XML : dans un attribut ou le contenu d'un élément XML, les caractères
+// spéciaux doivent être échappés :
+//   '  →  &apos;
+//   "  →  &quot;
+//   &  →  &amp;
+//   <  →  &lt;
+//   >  →  &gt;
 
 import { Router } from "express";
 import type { Request, Response } from "express";
@@ -28,6 +31,16 @@ function twimlLang(lang: "fr" | "en") {
   return lang === "fr" ? "fr-FR" : "en-US";
 }
 
+// Échappe les caractères spéciaux XML dans le texte des balises <Say>
+function xmlEscape(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 function buildSpeechBlocks(
   lang: "fr" | "en",
   userName: string,
@@ -35,21 +48,22 @@ function buildSpeechBlocks(
 ): string {
   const voice = twimlVoice(lang);
   const langAttr = twimlLang(lang);
+  const safeName = xmlEscape(userName);
 
   if (lang === "fr") {
     const locationLine = hasLocation
       ? "Leur dernière position connue a été envoyée par SMS."
-      : "Leur position n'est pas disponible pour le moment.";
+      : "Leur position n&apos;est pas disponible pour le moment.";
 
     return `
   <Say voice="${voice}" language="${langAttr}">Bonjour.</Say>
   <Pause length="1"/>
   <Say voice="${voice}" language="${langAttr}">
-    Ceci est une alerte automatique de l'application Safety Check.
+    Ceci est une alerte automatique de l&apos;application Safety Check.
   </Say>
   <Pause length="1"/>
   <Say voice="${voice}" language="${langAttr}">
-    ${userName} n'a pas répondu à ses vérifications de sécurité et pourrait avoir besoin d'aide immédiate.
+    ${safeName} n&apos;a pas répondu à ses vérifications de sécurité et pourrait avoir besoin d&apos;aide immédiate.
   </Say>
   <Pause length="1"/>
   <Say voice="${voice}" language="${langAttr}">
@@ -74,7 +88,7 @@ function buildSpeechBlocks(
   </Say>
   <Pause length="1"/>
   <Say voice="${voice}" language="${langAttr}">
-    ${userName} has not responded to their safety check-ins and may need immediate help.
+    ${safeName} has not responded to their safety check-ins and may need immediate help.
   </Say>
   <Pause length="1"/>
   <Say voice="${voice}" language="${langAttr}">
@@ -88,8 +102,6 @@ function buildSpeechBlocks(
 }
 
 // ─── GET /twiml/voice ─────────────────────────────────────────────────────────
-// Twilio appelle cette URL quand le contact décroche.
-// Query params : alertId, lang ('fr' | 'en')
 
 twimlRouter.get("/voice", async (req: Request, res: Response) => {
   const alertId = req.query.alertId as string | undefined;
@@ -99,7 +111,7 @@ twimlRouter.get("/voice", async (req: Request, res: Response) => {
     let userName = lang === "fr" ? "votre contact" : "your contact";
     let hasLocation = false;
 
-    if (alertId) {
+    if (alertId && alertId !== "TEST") {
       const alert = await db.alertEvent.findUnique({
         where: { id: alertId },
         include: { user: true },
@@ -107,8 +119,7 @@ twimlRouter.get("/voice", async (req: Request, res: Response) => {
       if (alert?.user?.firstName) {
         userName = alert.user.firstName;
       }
-      hasLocation =
-        alert?.latAtTrigger != null && alert?.lngAtTrigger != null;
+      hasLocation = alert?.latAtTrigger != null && alert?.lngAtTrigger != null;
     }
 
     const voice = twimlVoice(lang);
@@ -118,10 +129,9 @@ twimlRouter.get("/voice", async (req: Request, res: Response) => {
       ? `${BASE_URL}/twiml/gather?alertId=${encodeURIComponent(alertId)}&lang=${lang}`
       : `${BASE_URL}/twiml/gather?lang=${lang}`;
 
-    const thankyouMsg =
-      lang === "fr"
-        ? "Merci. Veuillez vérifier leur situation dès que possible."
-        : "Thank you. Please check on them as soon as possible.";
+    const thankyouMsg = lang === "fr"
+      ? "Merci. Veuillez vérifier leur situation dès que possible."
+      : "Thank you. Please check on them as soon as possible.";
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -137,6 +147,7 @@ twimlRouter.get("/voice", async (req: Request, res: Response) => {
     res.type("text/xml").send(xml);
   } catch (err) {
     console.error("❌ /twiml/voice error:", err);
+    // Fallback générique si DB inaccessible
     res.type("text/xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Polly.Joanna" language="en-US">
@@ -163,10 +174,9 @@ twimlRouter.post("/gather", async (req: Request, res: Response) => {
 
   const voice = twimlVoice(lang);
   const langAttr = twimlLang(lang);
-  const msg =
-    lang === "fr"
-      ? "Merci. Prenez soin de vérifier la situation rapidement. Au revoir."
-      : "Thank you. Please check on them as soon as possible. Goodbye.";
+  const msg = lang === "fr"
+    ? "Merci. Prenez soin de vérifier la situation rapidement. Au revoir."
+    : "Thank you. Please check on them as soon as possible. Goodbye.";
 
   return res.type("text/xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -182,9 +192,7 @@ twimlRouter.post("/amd-callback", async (req: Request, res: Response) => {
     CallSid?: string;
     AnsweredBy?: string;
   };
-
   console.log(`🤖 AMD — CallSid: ${CallSid}, AnsweredBy: ${AnsweredBy}`);
-
   if (CallSid) {
     try {
       await db.alertAction.updateMany({
@@ -195,7 +203,6 @@ twimlRouter.post("/amd-callback", async (req: Request, res: Response) => {
       console.error("❌ AMD callback DB update failed:", err);
     }
   }
-
   res.sendStatus(204);
 });
 
@@ -207,11 +214,7 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
     CallStatus?: string;
     CallDuration?: string;
   };
-
-  console.log(
-    `📞 Call status — SID: ${CallSid}, Status: ${CallStatus}, Duration: ${CallDuration ?? "?"}s`,
-  );
-
+  console.log(`📞 Call status — SID: ${CallSid}, Status: ${CallStatus}, Duration: ${CallDuration ?? "?"}s`);
   if (CallSid) {
     try {
       await db.alertAction.updateMany({
@@ -219,8 +222,6 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
         data: {
           callStatus: CallStatus ?? null,
           callDuration: CallDuration ? parseInt(CallDuration, 10) : null,
-          // outcome est non-nullable en DB — on n'écrase pas la valeur existante
-          // si CallStatus est absent (undefined = Prisma ignore le champ)
           ...(CallStatus !== undefined && { outcome: CallStatus }),
         },
       });
@@ -228,6 +229,5 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
       console.error("❌ Call status DB update failed:", err);
     }
   }
-
   res.sendStatus(204);
 });
