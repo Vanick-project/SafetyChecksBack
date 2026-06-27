@@ -107,6 +107,12 @@ twimlRouter.get("/voice", async (req: Request, res: Response) => {
   const alertId = req.query.alertId as string | undefined;
   const lang: "fr" | "en" = req.query.lang === "en" ? "en" : "fr";
 
+  // CRITIQUE : désactive le cache HTTP — Twilio doit recevoir 200 + XML à chaque appel.
+  // Un 304 "Not Modified" est interprété comme une erreur par Twilio → message d'erreur anglais.
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+
   try {
     let userName = lang === "fr" ? "votre contact" : "your contact";
     let hasLocation = false;
