@@ -219,6 +219,12 @@ if (connection) {
         if (user.status !== "ACTIVE") {
           console.log(`⏸️ User ${userId} not ACTIVE — stopped`); return;
         }
+        // AJOUT : vérifier que l'utilisateur a un token FCM valide
+        if (!user.fcmToken) {
+          console.warn(`⚠️ User ${userId} has no FCM token — notification cannot be sent`);
+          // On continue quand même pour incrémenter les tentatives et déclencher le SOS
+          // si l'utilisateur ne répond pas (il n'a peut-être pas ouvert l'app depuis longtemps)
+        }
 
         if (attempt > 1) {
           const unanswered = await db.checkInEvent.findFirst({
