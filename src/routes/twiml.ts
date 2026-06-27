@@ -54,7 +54,7 @@ function buildSpeechBlocks(
   <Pause length="1"/>
   <Say voice="${voice}" language="${langAttr}">
     ${locationLine} Veuillez essayer de les contacter immédiatement.
-    Si vous ne pouvez pas les joindre, appelez les services d'urgence.
+    Si vous ne pouvez pas les joindre, appelez le 9-1-1 immédiatement.
   </Say>
   <Pause length="1"/>
   <Say voice="${voice}" language="${langAttr}">
@@ -79,7 +79,7 @@ function buildSpeechBlocks(
   <Pause length="1"/>
   <Say voice="${voice}" language="${langAttr}">
     ${locationLine} Please try to contact them immediately.
-    If you cannot reach them, please call emergency services.
+    If you cannot reach them, please call 9-1-1 immediately.
   </Say>
   <Pause length="1"/>
   <Say voice="${voice}" language="${langAttr}">
