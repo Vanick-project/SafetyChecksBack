@@ -164,6 +164,64 @@ twimlRouter.get("/voice", async (req: Request, res: Response) => {
   }
 });
 
+// Twilio peut appeler /twiml/voice en POST selon la configuration du numéro
+// ou lors de redirections internes — on accepte les deux méthodes.
+twimlRouter.post("/voice", async (req: Request, res: Response) => {
+  // En POST, alertId et lang peuvent être dans le body ou la query string
+  const alertId = (req.query.alertId || req.body?.alertId) as string | undefined;
+  const lang: "fr" | "en" = ((req.query.lang || req.body?.lang) === "en") ? "en" : "fr";
+
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+
+  try {
+    let userName = lang === "fr" ? "votre contact" : "your contact";
+    let hasLocation = false;
+
+    if (alertId && alertId !== "TEST") {
+      const alert = await db.alertEvent.findUnique({
+        where: { id: alertId },
+        include: { user: true },
+      });
+      if (alert?.user?.firstName) userName = alert.user.firstName;
+      hasLocation = alert?.latAtTrigger != null && alert?.lngAtTrigger != null;
+    }
+
+    const voice = twimlVoice(lang);
+    const langAttr = twimlLang(lang);
+    const speechBlocks = buildSpeechBlocks(lang, userName, hasLocation);
+    const gatherUrl = alertId
+      ? `${BASE_URL}/twiml/gather?alertId=${encodeURIComponent(alertId)}&amp;lang=${lang}`
+      : `${BASE_URL}/twiml/gather?lang=${lang}`;
+    const thankyouMsg = lang === "fr"
+      ? "Merci. Veuillez vérifier leur situation dès que possible."
+      : "Thank you. Please check on them as soon as possible.";
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Pause length="1"/>
+  ${speechBlocks}
+  <Gather numDigits="1" action="${gatherUrl}" method="POST" timeout="8">
+    <Pause length="8"/>
+  </Gather>
+  <Say voice="${voice}" language="${langAttr}">${thankyouMsg}</Say>
+  <Hangup/>
+</Response>`;
+
+    res.type("text/xml").send(xml);
+  } catch (err) {
+    console.error("❌ POST /twiml/voice error:", err);
+    res.type("text/xml").send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna" language="en-US">
+    This is a Safety Check emergency alert. Please check on your contact immediately.
+  </Say>
+  <Hangup/>
+</Response>`);
+  }
+});
+
 // ─── POST /twiml/gather ───────────────────────────────────────────────────────
 
 twimlRouter.post("/gather", async (req: Request, res: Response) => {
