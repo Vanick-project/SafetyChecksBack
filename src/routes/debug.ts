@@ -71,7 +71,7 @@ router.post("/trigger-checkin/:userId", async (req: Request, res: Response) => {
 router.post("/reschedule/:userId", async (req: Request, res: Response) => {
   try {
     const userId = param(req.params.userId);
-    const { delaySeconds = 30 } = req.body as { delaySeconds?: number };
+    const { delaySeconds = 30 } = (req.body ?? {}) as { delaySeconds?: number };
 
     if (!checkInQueue) {
       return res.status(503).json({ error: "Check-in queue unavailable" });
