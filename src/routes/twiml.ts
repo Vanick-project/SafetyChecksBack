@@ -7,6 +7,19 @@ console.log("✅ twimlRouter loaded");
 
 const BASE_URL = process.env.API_BASE_URL!;
 
+// ─── HELPER ──────────────────────────────────────────────────────────────────
+// Twilio peut envoyer le même param dans query ET body simultanément
+// → Express combine en tableau → Prisma crash avec "Expected String, provided (String, String)"
+// Ce helper extrait toujours la première valeur string.
+
+function param(value: unknown): string {
+  if (!value) return "";
+  if (Array.isArray(value)) return String(value[0] ?? "");
+  return String(value);
+}
+
+// ─── HELPERS VOIX ────────────────────────────────────────────────────────────
+
 function twimlVoice(lang: "fr" | "en") {
   return lang === "fr" ? "Polly.Lea" : "Polly.Joanna";
 }
@@ -43,9 +56,13 @@ function buildSpeechEn(name: string, hasLocation: boolean): string {
   ].join(" ");
 }
 
+// ─── VOICE ───────────────────────────────────────────────────────────────────
+
 async function handleVoice(req: Request, res: Response) {
-  const alertId = (req.query.alertId ?? req.body?.alertId) as string | undefined;
-  const lang: "fr" | "en" = ((req.query.lang ?? req.body?.lang) === "en") ? "en" : "fr";
+  // CORRECTION : param() protège contre les tableaux query+body combinés
+  const alertId = param(req.query.alertId ?? req.body?.alertId) || undefined;
+  const lang: "fr" | "en" =
+    param(req.query.lang ?? req.body?.lang) === "en" ? "en" : "fr";
 
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   res.setHeader("Pragma", "no-cache");
@@ -61,7 +78,6 @@ async function handleVoice(req: Request, res: Response) {
         include: { user: true },
       });
       if (alert?.user?.firstName) {
-        // Remplace les caractères non-ASCII pour Polly
         userName = alert.user.firstName
           .replace(/[éèêë]/g, "e")
           .replace(/[àâä]/g, "a")
@@ -71,22 +87,25 @@ async function handleVoice(req: Request, res: Response) {
           .replace(/[ç]/g, "c")
           .replace(/[^a-zA-Z0-9 _-]/g, "");
       }
-      hasLocation = alert?.latAtTrigger != null && alert?.lngAtTrigger != null;
+      hasLocation =
+        alert?.latAtTrigger != null && alert?.lngAtTrigger != null;
     }
 
     const voice = twimlVoice(lang);
     const langAttr = twimlLang(lang);
-    const speech = lang === "fr"
-      ? buildSpeechFr(userName, hasLocation)
-      : buildSpeechEn(userName, hasLocation);
+    const speech =
+      lang === "fr"
+        ? buildSpeechFr(userName, hasLocation)
+        : buildSpeechEn(userName, hasLocation);
 
     const gatherUrl = alertId
       ? `${BASE_URL}/twiml/gather?alertId=${encodeURIComponent(alertId)}&amp;lang=${lang}`
       : `${BASE_URL}/twiml/gather?lang=${lang}`;
 
-    const thanks = lang === "fr"
-      ? "Merci. Verifiez leur situation."
-      : "Thank you. Please check on them.";
+    const thanks =
+      lang === "fr"
+        ? "Merci. Verifiez leur situation."
+        : "Thank you. Please check on them.";
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -114,9 +133,13 @@ async function handleVoice(req: Request, res: Response) {
 twimlRouter.get("/voice", handleVoice);
 twimlRouter.post("/voice", handleVoice);
 
+// ─── GATHER ──────────────────────────────────────────────────────────────────
+
 twimlRouter.post("/gather", async (req: Request, res: Response) => {
-  const alertId = (req.query.alertId ?? req.body?.alertId) as string | undefined;
-  const lang: "fr" | "en" = ((req.query.lang ?? req.body?.lang) === "en") ? "en" : "fr";
+  // CORRECTION : param() protège contre les tableaux query+body combinés
+  const alertId = param(req.query.alertId ?? req.body?.alertId) || undefined;
+  const lang: "fr" | "en" =
+    param(req.query.lang ?? req.body?.lang) === "en" ? "en" : "fr";
   const { Digits } = req.body as { Digits?: string };
 
   if (Digits === "1") {
@@ -137,8 +160,13 @@ twimlRouter.post("/gather", async (req: Request, res: Response) => {
 </Response>`);
 });
 
+// ─── AMD CALLBACK ────────────────────────────────────────────────────────────
+
 twimlRouter.post("/amd-callback", async (req: Request, res: Response) => {
-  const { CallSid, AnsweredBy } = req.body as { CallSid?: string; AnsweredBy?: string };
+  const { CallSid, AnsweredBy } = req.body as {
+    CallSid?: string;
+    AnsweredBy?: string;
+  };
   console.log(`🤖 AMD — ${CallSid}: ${AnsweredBy}`);
   if (CallSid) {
     try {
@@ -146,14 +174,20 @@ twimlRouter.post("/amd-callback", async (req: Request, res: Response) => {
         where: { providerSid: CallSid },
         data: { amdResult: AnsweredBy ?? "unknown" },
       });
-    } catch (e) { console.error("AMD DB error:", e); }
+    } catch (e) {
+      console.error("AMD DB error:", e);
+    }
   }
   res.sendStatus(204);
 });
 
+// ─── CALL STATUS ─────────────────────────────────────────────────────────────
+
 twimlRouter.post("/call-status", async (req: Request, res: Response) => {
   const { CallSid, CallStatus, CallDuration } = req.body as {
-    CallSid?: string; CallStatus?: string; CallDuration?: string;
+    CallSid?: string;
+    CallStatus?: string;
+    CallDuration?: string;
   };
   console.log(`📞 ${CallSid}: ${CallStatus} ${CallDuration ?? "?"}s`);
   if (CallSid) {
@@ -166,7 +200,9 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
           ...(CallStatus !== undefined && { outcome: CallStatus }),
         },
       });
-    } catch (e) { console.error("call-status DB error:", e); }
+    } catch (e) {
+      console.error("call-status DB error:", e);
+    }
   }
   res.sendStatus(204);
 });

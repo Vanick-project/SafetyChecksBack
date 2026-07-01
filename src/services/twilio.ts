@@ -45,9 +45,11 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
   const channel = (user as any).alertChannel ?? "sms";
   const language = (user as any).language ?? "fr";
 
-  const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
+  const lat = alert.latAtTrigger ?? user.lastLat;
+  const lng = alert.lngAtTrigger ?? user.lastLng;
+  const hasLocation = lat != null && lng != null;
   const mapsLink = hasLocation
-    ? `https://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}`
+    ? `https://www.google.com/maps?q=${lat},${lng}`
     : null;
 
   const body =
@@ -131,10 +133,12 @@ export async function sendLocationSMS(alertId: string): Promise<string> {
   const contact = user.emergencyContact;
   if (!contact) throw new Error("Emergency contact not found");
 
-  const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
-  const locationLine = hasLocation
-    ? `Last known location:\nhttps://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}\n\n`
-    : `Location is unavailable at this time.\n\n`;
+  const lat = alert.latAtTrigger ?? user.lastLat;
+const lng = alert.lngAtTrigger ?? user.lastLng;
+const hasLocation = lat != null && lng != null;
+const locationLine = hasLocation
+  ? `Last known location:\nhttps://www.google.com/maps?q=${lat},${lng}\n\n`
+  : `Location is unavailable at this time.\n\n`;
 
   const body =
     `SAFETY ALERT: ${user.firstName ?? "Your contact"} has not responded ` +
