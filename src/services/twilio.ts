@@ -1,18 +1,9 @@
 // ─── src/services/twilio.ts ──────────────────────────────────────────────────
 //
-// CORRECTIONS :
-//
-//   1. URL APPEL — callEmergencyContact pointait vers /twiml/alert (ancien endpoint
-//      qui n'existe plus dans twiml.ts). Maintenant pointe vers /twiml/voice
-//      avec alertId et lang en query params.
-//      /twiml/voice charge le nom et les coords depuis la DB → message personnalisé.
-//
-//   2. CALLBACKS AMD ET STATUS — asyncAmdStatusCallback pointe vers /twiml/amd-callback
-//      et statusCallback vers /twiml/call-status (dans twiml.ts),
-//      pour que les résultats AMD et le statut final soient sauvegardés en DB.
-//
-//   3. buildAlertTwiML retiré — le TwiML est maintenant construit dans twiml.ts
-//      directement depuis la DB. Plus besoin de ce helper ici.
+// CHANGEMENTS :
+//   1. sendLocationSMS et sendEscalationSMS : message unifié au format demandé :
+//      "Hello [Contact], This is SafetyCheck... Please call 911... [maps link]"
+//   2. callEmergencyContact : URL mise à jour vers /twiml/voice (nouveau endpoint)
 
 import twilio from "twilio";
 import { db } from "../db/client.js";
@@ -26,7 +17,41 @@ const client = twilio(
 const FROM_NUMBER = process.env.TWILIO_PHONE_NUMBER!;
 const BASE_URL = process.env.API_BASE_URL!;
 
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+function buildSMSBody(
+  contactName: string,
+  userName: string,
+  mapsLink: string | null,
+  language: string,
+): string {
+  // Format demandé exactement, avec localisation si disponible
+  if (language === "en") {
+    return (
+      `Hello ${contactName},\n\n` +
+      `This is SafetyCheck. We are contacting you on behalf of ${userName}. ` +
+      `We are unable to confirm whether ${userName} is safe at this time. ` +
+      `Please call 911 for a wellness check` +
+      (mapsLink
+        ? ` and review your private messages for his last known location.\n\nThank you.\n\n📍 ${mapsLink}`
+        : `.\n\nThank you.`)
+    );
+  }
+
+  // Français
+  return (
+    `Bonjour ${contactName},\n\n` +
+    `Ceci est SafetyCheck. Nous vous contactons au nom de ${userName}. ` +
+    `Nous ne sommes pas en mesure de confirmer si ${userName} est en securite. ` +
+    `Veuillez appeler le 911 pour une verification de bien-etre` +
+    (mapsLink
+      ? ` et consulter vos messages prives pour sa derniere position connue.\n\nMerci.\n\n📍 ${mapsLink}`
+      : `.\n\nMerci.`)
+  );
+}
+
 // ─── SMS D'ESCALADE ───────────────────────────────────────────────────────────
+// Envoyé au contact d'urgence après MAX_CALL_ATTEMPTS appels sans réponse.
 
 export async function sendEscalationSMS(alertId: string): Promise<void> {
   const alert = await db.alertEvent.findUnique({
@@ -45,29 +70,12 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
   const channel = (user as any).alertChannel ?? "sms";
   const language = (user as any).language ?? "fr";
 
-  const lat = alert.latAtTrigger ?? user.lastLat;
-  const lng = alert.lngAtTrigger ?? user.lastLng;
-  const hasLocation = lat != null && lng != null;
+  const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
   const mapsLink = hasLocation
-    ? `https://www.google.com/maps?q=${lat},${lng}`
+    ? `https://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}`
     : null;
 
-  const body =
-    language === "en"
-      ? `Hello ${contactName},\n\n` +
-        `This is SafetyCheck. We are contacting you on behalf of ${userName}. ` +
-        `We are unable to confirm whether ${userName} is safe at this time. ` +
-        `Please call 911 for a wellness check` +
-        (mapsLink ? ` and review the link below for their last known location.` : `.`) +
-        `\n\nThank you.` +
-        (mapsLink ? `\n\n📍 ${mapsLink}` : "")
-      : `Bonjour ${contactName},\n\n` +
-        `Ceci est SafetyCheck. Nous vous contactons au nom de ${userName}. ` +
-        `Nous ne sommes pas en mesure de confirmer si ${userName} est en sécurité. ` +
-        `Veuillez appeler le 911 pour une vérification de bien-être` +
-        (mapsLink ? ` et consultez le lien ci-dessous pour sa dernière position connue.` : `.`) +
-        `\n\nMerci.` +
-        (mapsLink ? `\n\n📍 ${mapsLink}` : "");
+  const body = buildSMSBody(contactName, userName, mapsLink, language);
 
   const sendSMS = async () => {
     const message = await client.messages.create({
@@ -120,6 +128,8 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
 }
 
 // ─── SMS DE POSITION ──────────────────────────────────────────────────────────
+// Envoyé immédiatement quand l'alerte se déclenche (SOS manuel ou auto).
+// Utilise le même format de message que sendEscalationSMS.
 
 export async function sendLocationSMS(alertId: string): Promise<string> {
   const alert = await db.alertEvent.findUnique({
@@ -133,18 +143,16 @@ export async function sendLocationSMS(alertId: string): Promise<string> {
   const contact = user.emergencyContact;
   if (!contact) throw new Error("Emergency contact not found");
 
-  const lat = alert.latAtTrigger ?? user.lastLat;
-const lng = alert.lngAtTrigger ?? user.lastLng;
-const hasLocation = lat != null && lng != null;
-const locationLine = hasLocation
-  ? `Last known location:\nhttps://www.google.com/maps?q=${lat},${lng}\n\n`
-  : `Location is unavailable at this time.\n\n`;
+  const userName = user.firstName ?? "your contact";
+  const contactName = contact.name;
+  const language = (user as any).language ?? "fr";
 
-  const body =
-    `SAFETY ALERT: ${user.firstName ?? "Your contact"} has not responded ` +
-    `to their Safety Check app.\n\n` +
-    locationLine +
-    `If you cannot reach them, please call emergency services.`;
+  const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
+  const mapsLink = hasLocation
+    ? `https://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}`
+    : null;
+
+  const body = buildSMSBody(contactName, userName, mapsLink, language);
 
   const message = await client.messages.create({
     body,
@@ -196,10 +204,8 @@ export async function callEmergencyContact(alertId: string) {
     );
   }
 
-  // CORRECTION : URL pointe vers /twiml/voice avec alertId et lang
-  // → twiml.ts charge le nom et les coords depuis la DB
-  // → message vocal personnalisé FR ou EN selon la langue de l'utilisateur
   const lang = (user as any).language ?? "fr";
+
   const twimlUrl =
     `${BASE_URL}/twiml/voice` +
     `?alertId=${encodeURIComponent(alertId)}` +
@@ -210,16 +216,11 @@ export async function callEmergencyContact(alertId: string) {
     from: FROM_NUMBER,
     to: contact.phoneNumber,
     timeout: 20,
-    // CORRECTION : statusCallback → /twiml/call-status (dans twiml.ts)
     statusCallback: `${BASE_URL}/twiml/call-status`,
     statusCallbackMethod: "POST",
     statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
-    // AMD = Answering Machine Detection
-    // DetectMessageEnd attend la fin du message répondeur avant de jouer le TwiML
-    // (meilleur que Enable qui coupe au milieu du message répondeur)
     machineDetection: "DetectMessageEnd",
     asyncAmd: "true",
-    // CORRECTION : amdCallback → /twiml/amd-callback (dans twiml.ts)
     asyncAmdStatusCallback: `${BASE_URL}/twiml/amd-callback`,
     asyncAmdStatusCallbackMethod: "POST",
   });
@@ -237,8 +238,13 @@ export async function callEmergencyContact(alertId: string) {
 
   console.log(
     `📞 Emergency call attempt ${previousAttempts + 1}/${MAX_CALL_ATTEMPTS} ` +
-      `created for alert ${alertId} → SID ${call.sid}`,
+    `created for alert ${alertId} → SID ${call.sid}`,
   );
 
   return call.sid;
+}
+
+// buildAlertTwiML conservé pour compatibilité — ne plus utiliser en production
+export function buildAlertTwiML(name: string, _mapsLink: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Say>${name}</Say></Response>`;
 }
