@@ -1,8 +1,4 @@
 // ─── src/routes/support.ts ───────────────────────────────────────────────────
-//
-// Route pour recevoir les messages du formulaire "Contactez-nous".
-// Les messages sont stockés dans la table SupportMessage pour consultation
-// manuelle (Railway PostgreSQL Query Tab) ou future interface admin.
 
 import { Router } from "express";
 import type { Request, Response } from "express";
@@ -52,15 +48,18 @@ router.post("/contact", async (req: Request, res: Response) => {
   }
 });
 
-// GET /support/messages — pour consultation admin (à protéger avec auth plus tard)
+// GET /support/messages
 router.get("/messages", async (req: Request, res: Response) => {
   try {
     const status = req.query.status as string | undefined;
+
+    // CORRECTION : spread conditionnel — exactOptionalPropertyTypes interdit where: undefined
     const messages = await db.supportMessage.findMany({
-      where: status ? { status } : undefined,
+      ...(status ? { where: { status } } : {}),
       orderBy: { createdAt: "desc" },
       take: 100,
     });
+
     return res.json(messages);
   } catch (err) {
     console.error("GET /support/messages error:", err);
