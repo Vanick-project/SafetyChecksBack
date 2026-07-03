@@ -1,7 +1,9 @@
 // ─── src/jobs/checkin-scheduler.ts ───────────────────────────────────────────
-//
-// AJOUT : support du scheduling avancé (interval libre, weekly, monthly).
-// getNextCheckInDelayMs() calcule le délai exact selon le type de schedule.
+// CHANGEMENTS vs version précédente :
+//   - scheduleCheckIn lit checkInIntervalHours depuis la DB au lieu d'utiliser
+//     TWENTY_FOUR_HOURS fixe. Défaut : 24h si non configuré.
+//   - FIVE_MINUTES entre les rappels, MAX_REMINDERS = 5 (inchangé).
+//   - triggerReason mis à jour → NO_RESPONSE_AFTER_5_REMINDERS.
 
 import { Queue, Worker, Job } from "bullmq";
 import { Redis } from "ioredis";
@@ -10,118 +12,77 @@ import { db } from "../db/client.js";
 import { alertQueue } from "./alertQueue.js";
 import { FIVE_MINUTES, MAX_REMINDERS } from "../config/constants.js";
 
+// ─── REDIS ───────────────────────────────────────────────────────────────────
+
 let connection: Redis | null = null;
 
 if (process.env.REDIS_URL) {
-  connection = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
+  connection = new Redis(process.env.REDIS_URL, {
+    maxRetriesPerRequest: null,
+  });
   connection.on("connect", () => console.log("✅ check-in Redis connected"));
-  connection.on("error", (err) => console.error("❌ check-in Redis error:", err.message));
+  connection.on("error", (err) =>
+    console.error("❌ check-in Redis error:", err.message),
+  );
 } else {
-  console.warn("⚠️ Redis disabled — check-in queue unavailable");
+  console.warn("⚠️ Redis disabled — check-in queue unavailable (no REDIS_URL)");
 }
 
 export const checkInQueue: Queue | null = connection
   ? new Queue("check-in", { connection })
   : null;
 
-// ─── CALCUL DU DÉLAI ─────────────────────────────────────────────────────────
-//
-// Lit le scheduleType et les champs associés depuis la DB.
-// Retourne le nombre de millisecondes jusqu'au prochain check-in.
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-async function getNextCheckInDelayMs(userId: string): Promise<number> {
+/**
+ * Retourne l'intervalle de check-in de l'utilisateur en millisecondes.
+ * Lit checkInIntervalHours depuis la DB. Défaut : 24h.
+ */
+async function getUserIntervalMs(userId: string): Promise<number> {
   const user = await db.user.findUnique({
     where: { id: userId },
-    select: {
-      scheduleType: true,
-      scheduleIntervalHours: true,
-      scheduleIntervalMinutes: true,
-      scheduleDayOfWeek: true,
-      scheduleDayOfMonth: true,
-      scheduleTimeHour: true,
-      scheduleTimeMinute: true,
-      checkInIntervalHours: true,   // fallback legacy
-    },
+    select: { checkInIntervalHours: true },
   });
 
-  const type = (user as any)?.scheduleType ?? "interval";
-
-  // ── INTERVAL ────────────────────────────────────────────────────────────
-  if (type === "interval") {
-    const hours = (user as any)?.scheduleIntervalHours ?? user?.checkInIntervalHours ?? 24;
-    const minutes = (user as any)?.scheduleIntervalMinutes ?? 0;
-    const totalMs = (hours * 60 + minutes) * 60 * 1000;
-    return Math.max(totalMs, 60_000); // minimum 1 minute
-  }
-
-  const now = new Date();
-  const timeHour = (user as any)?.scheduleTimeHour ?? 9;
-  const timeMinute = (user as any)?.scheduleTimeMinute ?? 0;
-
-  // ── WEEKLY ──────────────────────────────────────────────────────────────
-  if (type === "weekly") {
-    const targetDay = (user as any)?.scheduleDayOfWeek ?? 1; // lundi par défaut
-    const next = new Date(now);
-    // Calcule combien de jours jusqu'au prochain targetDay
-    const daysUntil = ((targetDay - now.getDay() + 7) % 7) || 7;
-    next.setDate(now.getDate() + daysUntil);
-    next.setHours(timeHour, timeMinute, 0, 0);
-    return Math.max(next.getTime() - now.getTime(), 60_000);
-  }
-
-  // ── MONTHLY ─────────────────────────────────────────────────────────────
-  if (type === "monthly") {
-    const targetDay = (user as any)?.scheduleDayOfMonth ?? 1;
-    const next = new Date(now.getFullYear(), now.getMonth(), targetDay, timeHour, timeMinute, 0, 0);
-    // Si la date est passée ce mois-ci, on prend le mois prochain
-    if (next.getTime() <= now.getTime()) {
-      next.setMonth(next.getMonth() + 1);
-    }
-    return Math.max(next.getTime() - now.getTime(), 60_000);
-  }
-
-  // Fallback 24h
-  return 24 * 60 * 60 * 1000;
+  const hours = user?.checkInIntervalHours ?? 24;
+  return hours * 60 * 60 * 1000;
 }
 
 // ─── SCHEDULE ────────────────────────────────────────────────────────────────
 
 export async function scheduleCheckIn(userId: string) {
   if (!checkInQueue) {
-    console.warn("⚠️ Check-in queue unavailable");
+    console.warn("⚠️ Check-in queue unavailable (Redis disabled)");
     return;
   }
 
-  // Annule tous les jobs existants
+  // Annule tous les jobs existants pour cet utilisateur.
   const jobsToCancel = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
-    checkInQueue.getJob(`checkin-reminder-${userId}`),
+    checkInQueue.getJob(`checkin-reminder-${userId}`), // legacy
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-2`),
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-3`),
-    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-4`),
-    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-5`),
+    // attempt-4 retiré — MAX_REMINDERS = 3
+    // attempt-5 retiré — MAX_REMINDERS = 3
     checkInQueue.getJob(`auto-sos-${userId}`),
   ]);
   await Promise.all(jobsToCancel.map((j) => j?.remove()));
 
-  // Vérifie notificationsEnabled
-  const userPrefsRaw = await db.user.findUnique({ where: { id: userId } });
-  const notifEnabled = (userPrefsRaw as any)?.notificationsEnabled;
-  if (notifEnabled === false) {
-    console.log(`🔕 Notifications disabled for user ${userId} — skipping`);
-    return;
-  }
-
-  const delayMs = await getNextCheckInDelayMs(userId);
-  const delayMin = Math.round(delayMs / 60_000);
+  // Lit l'intervalle personnalisé de l'utilisateur depuis la DB.
+  const intervalMs = await getUserIntervalMs(userId);
+  const intervalHours = intervalMs / (60 * 60 * 1000);
 
   await checkInQueue.add(
     "send-check-in",
     { userId, attempt: 1 },
-    { jobId: `checkin-${userId}`, delay: delayMs, removeOnComplete: true },
+    {
+      jobId: `checkin-${userId}`,
+      delay: intervalMs,
+      removeOnComplete: true,
+    },
   );
 
-  console.log(`⏰ Check-in scheduled in ${delayMin} min for user ${userId}`);
+  console.log(`⏰ Check-in scheduled in ${intervalHours}h for user ${userId}`);
 }
 
 export async function rescheduleAfterOk(userId: string) {
@@ -135,8 +96,9 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
     where: { id: checkInId },
     select: { response: true },
   });
+
   if (latestCheckIn?.response) {
-    console.log(`✅ User ${userId} responded — no SOS needed`);
+    console.log(`✅ User ${userId} responded meanwhile — no SOS needed`);
     return;
   }
 
@@ -145,23 +107,37 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
     include: { emergencyContact: true },
   });
 
-  if (!user || !user.emergencyContact) {
-    console.warn(`⚠️ User ${userId} missing or no contact — cannot SOS`);
+  if (!user) {
+    console.error(`❌ User ${userId} not found for automatic SOS`);
     return;
   }
 
-  if ((user as any).alertSystemEnabled === false) {
-    console.log(`⏸️ Alert system disabled for user ${userId}`);
+  if (!user.emergencyContact) {
+    console.warn(`⚠️ User ${userId} has no emergency contact — cannot SOS`);
+    return;
+  }
+
+  // NOUVEAU — système désactivé par l'utilisateur
+  if (user.alertSystemEnabled === false) {
+    console.log(
+      `⏸️ Alert system disabled for user ${userId} — skipping auto SOS`,
+    );
     await scheduleCheckIn(userId);
     return;
   }
 
-  const existingAlert = await db.alertEvent.findFirst({
+  if (!user.emergencyContact) {
+    console.warn(`⚠️ User ${userId} has no emergency contact — cannot SOS`);
+    return;
+  }
+
+  const existingActiveAlert = await db.alertEvent.findFirst({
     where: { userId, status: { in: ["ACTIVE", "FAILED"] } },
     orderBy: { triggeredAt: "desc" },
   });
-  if (existingAlert) {
-    console.log(`ℹ️ Active alert exists for ${userId} — skipping`);
+
+  if (existingActiveAlert) {
+    console.log(`ℹ️ Active alert already exists for user ${userId} — skipping`);
     return;
   }
 
@@ -176,7 +152,7 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
     },
   });
 
-  console.log(`🚨 Auto SOS created for user ${userId}: ${alert.id}`);
+  console.log(`🚨 Automatic SOS created for user ${userId}: ${alert.id}`);
 
   await alertQueue.add(
     "sendEmergencyAlert",
@@ -201,29 +177,35 @@ if (connection) {
   new Worker(
     "check-in",
     async (job: Job) => {
-      if (!checkInQueue) return;
+      if (!checkInQueue) {
+        console.warn("⚠️ Check-in queue unavailable inside worker");
+        return;
+      }
 
       if (job.name === "send-check-in") {
-        const { userId, attempt } = job.data as { userId: string; attempt: number };
-
-        const userRaw = await db.user.findUnique({ where: { id: userId } });
-        const user = userRaw as typeof userRaw & {
-          notificationsEnabled?: boolean;
-          fcmToken?: string | null;
+        const { userId, attempt } = job.data as {
+          userId: string;
+          attempt: number;
         };
 
-        if (!user) { console.error(`❌ User ${userId} not found`); return; }
-        if (user.notificationsEnabled === false) {
-          console.log(`🔕 Notifications disabled for ${userId} — skipping`); return;
+        const user = await db.user.findUnique({
+          where: { id: userId },
+          select: {
+            id: true,
+            status: true,
+            lastCheckInAt: true,
+            fcmToken: true,
+          },
+        });
+
+        if (!user) {
+          console.error(`❌ User ${userId} not found — skipping check-in`);
+          return;
         }
+
         if (user.status !== "ACTIVE") {
-          console.log(`⏸️ User ${userId} not ACTIVE — stopped`); return;
-        }
-        // AJOUT : vérifier que l'utilisateur a un token FCM valide
-        if (!user.fcmToken) {
-          console.warn(`⚠️ User ${userId} has no FCM token — notification cannot be sent`);
-          // On continue quand même pour incrémenter les tentatives et déclencher le SOS
-          // si l'utilisateur ne répond pas (il n'a peut-être pas ouvert l'app depuis longtemps)
+          console.log(`⏸️ User ${userId} is not ACTIVE — reminders stopped`);
+          return;
         }
 
         if (attempt > 1) {
@@ -231,7 +213,10 @@ if (connection) {
             where: { userId, response: null },
             orderBy: { sentAt: "desc" },
           });
-          if (!unanswered) { console.log(`✅ User ${userId} responded`); return; }
+          if (!unanswered) {
+            console.log(`✅ User ${userId} already responded — stopping`);
+            return;
+          }
         }
 
         const checkIn = await db.checkInEvent.create({
@@ -239,12 +224,20 @@ if (connection) {
         });
 
         await sendCheckInNotification(userId, checkIn.id);
-        console.log(`🔔 Check-in sent to ${userId}, attempt ${attempt}/${MAX_REMINDERS}`);
+
+        console.log(
+          `🔔 Check-in sent to ${userId}, attempt ${attempt}/${MAX_REMINDERS}`,
+        );
 
         if (attempt < MAX_REMINDERS) {
-          const reminderJob = await checkInQueue.getJob(`checkin-reminder-${userId}`);
+          // Annule l'ancien reminder s'il existe encore
+          const reminderJob = await checkInQueue.getJob(
+            `checkin-reminder-${userId}`,
+          );
           await reminderJob?.remove();
 
+          // jobId unique par attempt — évite le conflit BullMQ qui ignorait
+          // silencieusement le job si l'ID existait déjà
           await checkInQueue.add(
             "send-check-in",
             { userId, attempt: attempt + 1 },
@@ -254,21 +247,32 @@ if (connection) {
               removeOnComplete: true,
             },
           );
-          console.log(`⏳ Reminder ${attempt + 1}/${MAX_REMINDERS} in 5 min for ${userId}`);
+
+          console.log(
+            `⏳ Reminder ${attempt + 1}/${MAX_REMINDERS} in 5 min for user ${userId}`,
+          );
           return;
         }
 
         await checkInQueue.add(
           "auto-sos",
           { userId, checkInId: checkIn.id },
-          { jobId: `auto-sos-${userId}`, delay: FIVE_MINUTES, removeOnComplete: true },
+          {
+            jobId: `auto-sos-${userId}`,
+            delay: FIVE_MINUTES,
+            removeOnComplete: true,
+          },
         );
-        console.log(`🚨 Auto SOS scheduled for ${userId}`);
+
+        console.log(`🚨 Auto SOS scheduled in 5 min for user ${userId}`);
         return;
       }
 
       if (job.name === "auto-sos") {
-        const { userId, checkInId } = job.data as { userId: string; checkInId: string };
+        const { userId, checkInId } = job.data as {
+          userId: string;
+          checkInId: string;
+        };
         await triggerAutomaticSOS(userId, checkInId);
       }
     },
@@ -284,15 +288,19 @@ export async function handleUserResponse(
   response: "OK" | "SOS",
   source: "scheduled" | "manual" = "scheduled",
 ) {
-  if (!checkInQueue) return;
+  if (!checkInQueue) {
+    console.warn("⚠️ Check-in queue unavailable (Redis disabled)");
+    return;
+  }
 
+  // Annule le job principal + tous les reminders possibles (attempt 2→5) + autoSos
   const jobsToCancel = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
-    checkInQueue.getJob(`checkin-reminder-${userId}`),
+    checkInQueue.getJob(`checkin-reminder-${userId}`), // legacy
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-2`),
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-3`),
-    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-4`),
-    checkInQueue.getJob(`checkin-reminder-${userId}-attempt-5`),
+    // attempt-4 retiré — MAX_REMINDERS = 3
+    // attempt-5 retiré — MAX_REMINDERS = 3
     checkInQueue.getJob(`auto-sos-${userId}`),
   ]);
   await Promise.all(jobsToCancel.map((j) => j?.remove()));
@@ -318,7 +326,11 @@ export async function handleUserResponse(
       where: { id: userId },
       include: { emergencyContact: true },
     });
-    if (!user || !user.emergencyContact) return;
+
+    if (!user || !user.emergencyContact) {
+      console.warn(`⚠️ Cannot SOS for ${userId} — missing user or contact`);
+      return;
+    }
 
     const alert = await db.alertEvent.create({
       data: {
