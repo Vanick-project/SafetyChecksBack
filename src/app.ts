@@ -12,6 +12,7 @@ import { alertRouter } from "./routes/alerts.js";
 import { twimlRouter } from "./routes/twiml.js";
 import twilioWebhookRouter from "./routes/twilio-webhook.js";
 import debugRouter from "./routes/debug.js";
+import supportRouter from "./routes/support.js";
 import "./jobs/alertWorker.js";
 import "./jobs/checkin-scheduler.js";
 
@@ -45,6 +46,15 @@ const sosLimiter = rateLimit({
   message: { error: "Too many SOS alerts. Please contact support." },
 });
 
+// Limite anti-spam pour le formulaire de contact — 5 messages / heure / IP
+const supportLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many support requests. Please try again later." },
+});
+
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", message: "SafetyChecks backend is running" });
 });
@@ -55,6 +65,8 @@ app.use("/alerts/trigger", sosLimiter);
 app.use("/alerts", alertRouter);
 app.use("/twiml", twimlRouter);
 app.use("/twilio", twilioWebhookRouter);
+app.use("/support/contact", supportLimiter);
+app.use("/support", supportRouter);
 
 // Route debug — seulement en dev (jamais en prod)
 /*

@@ -142,3 +142,17 @@ model AlertAction {
 
   @@index([alertId])
 }
+
+// ─── SUPPORT MESSAGES (formulaire Contactez-nous) ─────────────────────────────
+
+model SupportMessage {
+  id           String   @id @default(cuid())
+  userId       String?
+  subject      String
+  message      String
+  contactEmail String?
+  status       String   @default("OPEN") // OPEN | IN_PROGRESS | RESOLVED
+  createdAt    DateTime @default(now())
+
+  @@index([status])
+}
