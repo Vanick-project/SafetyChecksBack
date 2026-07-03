@@ -11,12 +11,12 @@ export const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
 
 /**
  * Delay between check-in reminder notifications, in milliseconds.
- * CHANGED: 10 min → 5 min as per product requirements.
+ * 5 minutes between each reminder.
  */
 export const FIVE_MINUTES = 5 * 60 * 1000;
 
 /**
  * Maximum number of check-in reminders before triggering an automatic SOS.
- * CHANGED: 3 → 5 as per product requirements.
+ * CHANGED: 5 → 3 (3 notifications séparées de 5 min, puis SOS)
  */
-export const MAX_REMINDERS = 5;
+export const MAX_REMINDERS = 3;
