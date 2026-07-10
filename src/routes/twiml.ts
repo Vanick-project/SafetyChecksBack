@@ -1,9 +1,9 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { Queue } from "bullmq";
-import twilio from "twilio";
 import { db } from "../db/client.js";
 import { redisConnection } from "../lib/redis.js";
+import { RETRY_DELAY_MS } from "../config/constants.js";
 
 export const twimlRouter = Router();
 console.log("✅ twimlRouter loaded");
@@ -12,22 +12,12 @@ const BASE_URL = process.env.API_BASE_URL!;
 
 // ─── FILE BULLMQ (producteur) ─────────────────────────────────────────────────
 // Même nom + même connexion que le Worker de alertWorker.ts → même file.
-// Instance producteur autonome : pas besoin d'importer une file définie ailleurs.
 const alertQueue = new Queue("alertQueue", { connection: redisConnection });
 
-// Délai entre deux tentatives d'appel. (Déplaçable dans config/constants.ts.)
-const RETRY_DELAY_MS = 30_000;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// Client Twilio, uniquement pour raccrocher un répondeur détecté par AMD.
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID!,
-  process.env.TWILIO_AUTH_TOKEN!,
-);
-
-// ─── HELPER ──────────────────────────────────────────────────────────────────
-// Twilio peut envoyer le même param dans query ET body simultanément
-// → Express combine en tableau → Prisma crash avec "Expected String, provided (String, String)"
-// Ce helper extrait toujours la première valeur string.
+// ─── HELPER PARAM ─────────────────────────────────────────────────────────────
+// Twilio peut envoyer le même param dans query ET body → Express combine en tableau.
 
 function param(value: unknown): string {
   if (!value) return "";
@@ -35,7 +25,9 @@ function param(value: unknown): string {
   return String(value);
 }
 
+// ─── OUTCOME SÉMANTIQUE ───────────────────────────────────────────────────────
 // Traduit (CallStatus, amdResult) en un outcome lisible par le frontend.
+
 function callOutcome(status: string, amd: string | null): string {
   if (status === "completed") {
     if (amd === "human") return "answered_human";
@@ -49,7 +41,7 @@ function callOutcome(status: string, amd: string | null): string {
   return status;
 }
 
-// ─── HELPERS VOIX ────────────────────────────────────────────────────────────
+// ─── HELPERS VOIX ─────────────────────────────────────────────────────────────
 
 function twimlVoice(lang: "fr" | "en") {
   return lang === "fr" ? "Polly.Lea" : "Polly.Joanna";
@@ -69,7 +61,7 @@ function buildSpeechFr(name: string, hasLocation: boolean): string {
     name + " ne repond pas a ses verifications de securite.",
     loc + " Contactez-les immediatement.",
     "Si vous ne pouvez pas les joindre, appelez le neuf-un-un.",
-    "Pour repeter, appuyez sur 1. Sinon raccrochez.",
+    "Pour confirmer que vous avez bien recu cette alerte, appuyez sur 1.",
   ].join(" ");
 }
 
@@ -83,14 +75,13 @@ function buildSpeechEn(name: string, hasLocation: boolean): string {
     name + " has not responded to their safety check-ins.",
     loc + " Please contact them immediately.",
     "If you cannot reach them, please call 9-1-1.",
-    "To repeat this message press 1. Otherwise please hang up.",
+    "To confirm that you received this alert, press 1.",
   ].join(" ");
 }
 
-// ─── VOICE ───────────────────────────────────────────────────────────────────
+// ─── VOICE ────────────────────────────────────────────────────────────────────
 
 async function handleVoice(req: Request, res: Response) {
-  // CORRECTION : param() protège contre les tableaux query+body combinés
   const alertId = param(req.query.alertId ?? req.body?.alertId) || undefined;
   const lang: "fr" | "en" =
     param(req.query.lang ?? req.body?.lang) === "en" ? "en" : "fr";
@@ -138,13 +129,14 @@ async function handleVoice(req: Request, res: Response) {
         ? "Merci. Verifiez leur situation."
         : "Thank you. Please check on them.";
 
+    // Le Gather ne POST vers /gather QUE si le contact appuie sur une touche.
+    // En cas de non-réponse (timeout), on passe au Say + Hangup, et
+    // /call-status planifiera la tentative suivante.
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="1"/>
   <Say voice="${voice}" language="${langAttr}">${speech}</Say>
-  <Gather numDigits="1" action="${gatherUrl}" method="POST" timeout="8">
-    <Pause length="8"/>
-  </Gather>
+  <Gather numDigits="1" action="${gatherUrl}" method="POST" timeout="10"/>
   <Say voice="${voice}" language="${langAttr}">${thanks}</Say>
   <Hangup/>
 </Response>`;
@@ -164,26 +156,50 @@ async function handleVoice(req: Request, res: Response) {
 twimlRouter.get("/voice", handleVoice);
 twimlRouter.post("/voice", handleVoice);
 
-// ─── GATHER ──────────────────────────────────────────────────────────────────
+// ─── GATHER (CONFIRMATION HUMAINE) ────────────────────────────────────────────
+// Atteint UNIQUEMENT si le contact appuie sur une touche pendant l'appel.
+// Digits === "1" = preuve fiable qu'un humain a reçu l'alerte (sans dépendre d'AMD).
 
 twimlRouter.post("/gather", async (req: Request, res: Response) => {
-  // CORRECTION : param() protège contre les tableaux query+body combinés
   const alertId = param(req.query.alertId ?? req.body?.alertId) || undefined;
   const lang: "fr" | "en" =
     param(req.query.lang ?? req.body?.lang) === "en" ? "en" : "fr";
-  const { Digits } = req.body as { Digits?: string };
-
-  if (Digits === "1") {
-    const url = alertId
-      ? `${BASE_URL}/twiml/voice?alertId=${encodeURIComponent(alertId)}&lang=${lang}`
-      : `${BASE_URL}/twiml/voice?lang=${lang}`;
-    return res.redirect(303, url);
-  }
+  const CallSid = param(req.body.CallSid);
+  const Digits = param(req.body.Digits);
 
   const voice = twimlVoice(lang);
   const langAttr = twimlLang(lang);
-  const msg = lang === "fr" ? "Merci. Au revoir." : "Thank you. Goodbye.";
 
+  if (Digits === "1") {
+    // Marque CET appel comme répondu par un humain. /call-status le lira et
+    // n'ordonnera aucun retry, aucune escalade.
+    try {
+      if (CallSid) {
+        await db.alertAction.updateMany({
+          where: { providerSid: CallSid },
+          data: { outcome: "answered_human" },
+        });
+      }
+      console.log(
+        `✅ Contact a CONFIRMÉ (appui 1) — alert=${alertId} call=${CallSid}`,
+      );
+    } catch (e) {
+      console.error("gather confirm error:", e);
+    }
+
+    const msg =
+      lang === "fr"
+        ? "Merci. Verifiez leur situation. Au revoir."
+        : "Thank you. Please check on them. Goodbye.";
+    return res.type("text/xml").send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="${voice}" language="${langAttr}">${msg}</Say>
+  <Hangup/>
+</Response>`);
+  }
+
+  // Touche autre que 1 → pas de confirmation. On raccroche ; retry via call-status.
+  const msg = lang === "fr" ? "Au revoir." : "Goodbye.";
   return res.type("text/xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="${voice}" language="${langAttr}">${msg}</Say>
@@ -191,18 +207,16 @@ twimlRouter.post("/gather", async (req: Request, res: Response) => {
 </Response>`);
 });
 
-// ─── AMD CALLBACK ────────────────────────────────────────────────────────────
-// Reçoit le verdict AMD (human | machine_* | fax | unknown).
-// Écrit amdResult, et si c'est un répondeur CONFIRMÉ, raccroche tout de suite
-// pour ne pas attendre 39 s : le /call-status "completed" qui suit planifiera
-// la tentative suivante.
+// ─── AMD CALLBACK ─────────────────────────────────────────────────────────────
+// Enregistre le verdict AMD (filet de secours pour détecter un humain).
+// PAS de raccrochage ici : AMD prend parfois un humain pour un répondeur.
 
 twimlRouter.post("/amd-callback", async (req: Request, res: Response) => {
   const CallSid = param(req.body.CallSid);
   const AnsweredBy = param(req.body.AnsweredBy);
   console.log(`🤖 AMD — ${CallSid}: ${AnsweredBy}`);
 
-  res.sendStatus(204); // ack rapide à Twilio ; le reste est best-effort
+  res.sendStatus(204);
   if (!CallSid) return;
 
   try {
@@ -210,33 +224,14 @@ twimlRouter.post("/amd-callback", async (req: Request, res: Response) => {
       where: { providerSid: CallSid },
       data: { amdResult: AnsweredBy || "unknown" },
     });
-
-    // On ne raccroche que sur un répondeur CONFIRMÉ (pas "unknown", pour ne pas
-    // couper un vrai humain qu'AMD n'aurait pas su classer).
-    const confirmedMachine =
-      AnsweredBy.startsWith("machine") || AnsweredBy === "fax";
-
-    if (confirmedMachine) {
-      await twilioClient
-        .calls(CallSid)
-        .update({ status: "completed" })
-        .catch(() => {});
-      console.log(
-        `📭 Répondeur détecté (${AnsweredBy}) — appel raccroché, retry à venir.`,
-      );
-    }
   } catch (e) {
     console.error("AMD DB error:", e);
   }
 });
 
-// ─── CALL STATUS ─────────────────────────────────────────────────────────────
-// Source unique de décision retry/succès. Reçoit le statut final de chaque appel.
-//   - AMD = "human"           → contact joint, aucun retry (l'alerte reste ACTIVE
-//                               jusqu'au "I'm safe" de l'utilisateur).
-//   - répondeur / no-answer / busy / failed → planifie retryEmergencyCall.
-// C'est le worker (alertWorker.ts) qui, au bout de MAX_CALL_ATTEMPTS, passe
-// l'alerte à FAILED et envoie l'escalade SMS.
+// ─── CALL STATUS ──────────────────────────────────────────────────────────────
+// Décide succès vs retry. Succès = appui sur 1 (answered_human écrit par /gather)
+// OU AMD=human. Sinon → tentative suivante via retryEmergencyCall.
 
 twimlRouter.post("/call-status", async (req: Request, res: Response) => {
   const CallSid = param(req.body.CallSid);
@@ -254,58 +249,94 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
     });
     if (!action) return;
 
-    // Écrit le statut final de l'appel (comportement conservé)
-    // Écrit un outcome sémantique (answered_human | voicemail | no_answer | busy | ...)
-    await db.alertAction.update({
-      where: { id: action.id },
-      data: {
-        callStatus: CallStatus || null,
-        callDuration: CallDuration ? parseInt(CallDuration, 10) : null,
-        outcome: callOutcome(CallStatus, action.amdResult),
-      },
-    });
+    const dur = CallDuration ? parseInt(CallDuration, 10) : null;
 
-    // On ne réagit qu'aux états terminaux
+    // On ne réagit qu'aux états terminaux ; les états intermédiaires ne font
+    // que mettre à jour le statut brut.
     const terminal = ["completed", "busy", "no-answer", "failed", "canceled"];
-    if (!terminal.includes(CallStatus)) return;
+    if (!terminal.includes(CallStatus)) {
+      await db.alertAction.update({
+        where: { id: action.id },
+        data: { callStatus: CallStatus || null },
+      });
+      return;
+    }
 
     const alertId = action.alertId;
     if (!alertId) return;
 
-    // Ne pas relancer si l'alerte n'est plus active (résolue par "I'm safe",
-    // ou déjà passée à FAILED).
+    // 1) Confirmation par appui sur 1 (déterministe, écrite par /gather).
+    let confirmed = action.outcome === "answered_human";
+    let amd = action.amdResult;
+
+    // 2) Sinon, sur "completed" sans verdict AMD encore arrivé, court délai :
+    //    l'appui sur 1 OU l'AMD peuvent atterrir juste après le "completed".
+    if (!confirmed && CallStatus === "completed" && amd == null) {
+      await sleep(2500);
+      const fresh = await db.alertAction.findUnique({
+        where: { id: action.id },
+      });
+      amd = fresh?.amdResult ?? null;
+      if (fresh?.outcome === "answered_human") confirmed = true;
+    }
+
+    const humanReached =
+      confirmed || (CallStatus === "completed" && amd === "human");
+
+    // Ne pas relancer si l'alerte n'est plus active (résolue / déjà FAILED).
     const alert = await db.alertEvent.findUnique({ where: { id: alertId } });
     if (!alert || alert.status !== "ACTIVE") {
       console.log(
         `⏹️ Alerte ${alertId} non-active (${alert?.status ?? "introuvable"}) — pas de retry.`,
       );
-      return;
-    }
-
-    // Un humain a décroché → contact joint. On arrête les appels.
-    if (CallStatus === "completed" && action.amdResult === "human") {
-      console.log(`✅ Humain joint pour ${alertId} — aucun retry.`);
       await db.alertAction.update({
         where: { id: action.id },
-        data: { outcome: "answered_human" },
+        data: {
+          callStatus: CallStatus || null,
+          callDuration: dur,
+          outcome: humanReached ? "answered_human" : callOutcome(CallStatus, amd),
+        },
       });
       return;
     }
 
-    // Sinon (répondeur, sans réponse, occupé, échec) → tentative suivante.
+    // SUCCÈS : un humain a été joint → aucun retry, aucune escalade.
+    if (humanReached) {
+      console.log(`✅ Humain joint pour ${alertId} — aucun retry.`);
+      await db.alertAction.update({
+        where: { id: action.id },
+        data: {
+          callStatus: CallStatus || null,
+          callDuration: dur,
+          outcome: "answered_human",
+        },
+      });
+      return;
+    }
+
+    // ÉCHEC de cette tentative → outcome sémantique + planifie la suivante.
+    await db.alertAction.update({
+      where: { id: action.id },
+      data: {
+        callStatus: CallStatus || null,
+        callDuration: dur,
+        outcome: callOutcome(CallStatus, amd),
+      },
+    });
+
     await alertQueue.add(
       "retryEmergencyCall",
       { alertId },
       {
         delay: RETRY_DELAY_MS,
-        jobId: `retry-${CallSid}`, // dédup si Twilio renvoie le même webhook
+        jobId: `retry-${CallSid}`,
         removeOnComplete: true,
         removeOnFail: true,
       },
     );
     console.log(
       `🔁 Retry planifié pour ${alertId} dans ${RETRY_DELAY_MS / 1000}s ` +
-        `— cause: ${CallStatus}/${action.amdResult ?? "no-amd"}`,
+        `— cause: ${CallStatus}/${amd ?? "no-amd"}`,
     );
   } catch (e) {
     console.error("call-status error:", e);
