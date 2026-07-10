@@ -35,6 +35,20 @@ function param(value: unknown): string {
   return String(value);
 }
 
+// Traduit (CallStatus, amdResult) en un outcome lisible par le frontend.
+function callOutcome(status: string, amd: string | null): string {
+  if (status === "completed") {
+    if (amd === "human") return "answered_human";
+    if (amd && (amd.startsWith("machine") || amd === "fax")) return "voicemail";
+    return "completed";
+  }
+  if (status === "no-answer") return "no_answer";
+  if (status === "busy") return "busy";
+  if (status === "failed") return "failed";
+  if (status === "canceled") return "canceled";
+  return status;
+}
+
 // ─── HELPERS VOIX ────────────────────────────────────────────────────────────
 
 function twimlVoice(lang: "fr" | "en") {
@@ -241,12 +255,13 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
     if (!action) return;
 
     // Écrit le statut final de l'appel (comportement conservé)
+    // Écrit un outcome sémantique (answered_human | voicemail | no_answer | busy | ...)
     await db.alertAction.update({
       where: { id: action.id },
       data: {
         callStatus: CallStatus || null,
         callDuration: CallDuration ? parseInt(CallDuration, 10) : null,
-        outcome: CallStatus || action.outcome,
+        outcome: callOutcome(CallStatus, action.amdResult),
       },
     });
 
