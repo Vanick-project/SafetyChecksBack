@@ -38,14 +38,14 @@ router.post("/register", async (req: Request, res: Response) => {
   try {
     const parsed = registerUserSchema.parse(req.body);
     const {
-      phoneNumber, firstName, address, city, country, zipCode,
+      phoneNumber, firstName, address, city, country, zipCode, province,
       emergencyContact, checkInIntervalHours, language,
     } = parsed;
 
     const user = await db.user.upsert({
       where: { phoneNumber },
-      update: { firstName, address, city, country, zipCode, checkInIntervalHours, language },
-      create: { phoneNumber, firstName, address, city, country, zipCode, checkInIntervalHours, language },
+      update: { firstName, address, city, country, zipCode, province: province ?? "", checkInIntervalHours, language },
+      create: { phoneNumber, firstName, address, city, country, zipCode, province: province ?? "", checkInIntervalHours, language },
     });
 
     await db.emergencyContact.upsert({

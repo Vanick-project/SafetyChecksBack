@@ -1,7 +1,13 @@
 // ─── src/routes/twilio-webhook.ts ────────────────────────────────────────────
-// ESCALADE :
-//   Après 3 appels sans réponse → SMS bilingue au contact d'urgence
-//   (jamais au 911 directement — approche légale pour app automatisée)
+//
+// FIX RETRY APPEL :
+//   Le "in-progress" met maintenant humanAnswered = true immédiatement.
+//   Un humain qui décroche = succès. Quand "completed" arrive :
+//     - humanAnswered = true  → succès, pas de retry
+//     - humanAnswered = false → pas de réponse humaine → retry dans RETRY_DELAY_MS
+//
+//   RETRY_DELAY_MS = 5 minutes (300_000 ms) dans constants.ts
+//   MAX_CALL_ATTEMPTS = 3 → 1 appel initial + 2 retries = 3 total
 
 import { Router } from "express";
 import type { Request, Response, NextFunction } from "express";
@@ -13,7 +19,7 @@ import { sendEscalationSMS } from "../services/twilio.js";
 
 const router = Router();
 
-// ─── TWILIO SIGNATURE VALIDATION ─────────────────────────────────────────────
+// ─── VALIDATION SIGNATURE TWILIO ─────────────────────────────────────────────
 
 function validateTwilioSignature(
   req: Request,
@@ -23,7 +29,6 @@ function validateTwilioSignature(
   if (process.env.SKIP_TWILIO_VALIDATION === "true") {
     return next();
   }
-
   const authToken = process.env.TWILIO_AUTH_TOKEN!;
   const twilioSignature = req.headers["x-twilio-signature"] as string;
   const baseUrl = (process.env.API_BASE_URL ?? "").replace(/\/$/, "");
@@ -40,47 +45,31 @@ function validateTwilioSignature(
     console.warn("⚠️ Invalid Twilio signature for:", fullUrl);
     return res.status(403).send("Forbidden");
   }
-
   return next();
 }
 
 router.use(validateTwilioSignature);
 
 // ─── ESCALADE ─────────────────────────────────────────────────────────────────
-// Déclenché après MAX_CALL_ATTEMPTS appels sans réponse.
-// Envoie un SMS bilingue au contact d'urgence (pas au 911).
 
 async function handleEscalation(alertId: string) {
-  // Idempotent — ne jamais escalader deux fois
   const existing = await db.alertAction.findFirst({
     where: { alertId, actionType: "CALL", destination: "escalation" },
   });
 
   if (existing) {
-    console.log(
-      `ℹ️ Escalation already handled for alert ${alertId} — skipping`,
-    );
+    console.log(`ℹ️ Escalation already handled for alert ${alertId} — skipping`);
     return;
   }
 
   try {
-    // Envoie le SMS bilingue au contact d'urgence
     await sendEscalationSMS(alertId);
-
-    await db.alertEvent.update({
-      where: { id: alertId },
-      data: { status: "ACTIVE" },
-    });
-
-    console.log(
-      `🚨 Escalation SMS sent to emergency contact for alert ${alertId}`,
-    );
+    console.log(`🚨 Escalation SMS sent for alert ${alertId}`);
   } catch (err) {
     console.error(
       `❌ Escalation SMS failed for alert ${alertId}:`,
       err instanceof Error ? err.message : err,
     );
-
     await db.alertEvent.update({
       where: { id: alertId },
       data: { status: "FAILED" },
@@ -88,29 +77,25 @@ async function handleEscalation(alertId: string) {
   }
 }
 
-// ─── RETRY HELPER ─────────────────────────────────────────────────────────────
+// ─── RETRY ────────────────────────────────────────────────────────────────────
 
 async function scheduleCallRetry(alertId: string, currentAttemptCount: number) {
-  // Vérifie que l'alerte n'a pas été résolue entre-temps
   const alert = await db.alertEvent.findUnique({
     where: { id: alertId },
     select: { status: true },
   });
 
   if (!alert || alert.status === "RESOLVED") {
-    console.log(
-      `✅ Alert ${alertId} is RESOLVED — skipping retry and escalation`,
-    );
+    console.log(`✅ Alert ${alertId} RESOLVED — skipping retry`);
     return;
   }
 
   if (currentAttemptCount < MAX_CALL_ATTEMPTS) {
+    const delayMin = Math.round(RETRY_DELAY_MS / 60_000);
     console.log(
-      `🔁 Scheduling retry for alert ${alertId}. ` +
-        `Attempt ${currentAttemptCount + 1}/${MAX_CALL_ATTEMPTS} ` +
-        `in ${RETRY_DELAY_MS / 1000}s`,
+      `🔁 Retry ${currentAttemptCount + 1}/${MAX_CALL_ATTEMPTS} ` +
+      `for alert ${alertId} in ${delayMin} min`,
     );
-
     await alertQueue.add(
       "retryEmergencyCall",
       { alertId },
@@ -122,10 +107,7 @@ async function scheduleCallRetry(alertId: string, currentAttemptCount: number) {
       },
     );
   } else {
-    console.log(
-      `🚨 Max attempts (${MAX_CALL_ATTEMPTS}) reached for alert ${alertId}. ` +
-        `Sending escalation SMS to emergency contact.`,
-    );
+    console.log(`🚨 Max attempts (${MAX_CALL_ATTEMPTS}) reached for ${alertId} — escalating`);
     await handleEscalation(alertId);
   }
 }
@@ -146,10 +128,11 @@ router.post("/call-status", async (req: Request, res: Response) => {
     });
 
     if (!action) {
-      console.warn("⚠️ No action found for CallSid:", CallSid);
+      console.warn("⚠️ No AlertAction for CallSid:", CallSid);
       return res.sendStatus(200);
     }
 
+    // États transitoires — pas d'action
     if (["queued", "initiated", "ringing"].includes(CallStatus)) {
       await db.alertAction.update({
         where: { id: action.id },
@@ -158,35 +141,44 @@ router.post("/call-status", async (req: Request, res: Response) => {
       return res.sendStatus(200);
     }
 
+    // ── CONTACT A DÉCROCHÉ ────────────────────────────────────────────────────
+    // "in-progress" = contact a décroché et écoute le message.
+    // On marque humanAnswered = true IMMÉDIATEMENT — pas besoin d'attendre AMD.
     if (CallStatus === "in-progress" || CallStatus === "answered") {
       await db.alertAction.update({
         where: { id: action.id },
-        data: { outcome: "in-progress" },
+        data: {
+          humanAnswered: true,
+          outcome: "success",
+        },
       });
+      console.log(`✅ Contact answered alert ${action.alertId} — marked success`);
       return res.sendStatus(200);
     }
 
+    // ── APPEL TERMINÉ ─────────────────────────────────────────────────────────
     if (CallStatus === "completed") {
-      const latestAction = await db.alertAction.findUnique({
+      const latest = await db.alertAction.findUnique({
         where: { id: action.id },
         select: { humanAnswered: true },
       });
 
-      if (latestAction?.humanAnswered) {
+      if (latest?.humanAnswered) {
+        // Contact a décroché et entendu le message → succès confirmé
         await db.alertAction.update({
           where: { id: action.id },
           data: { outcome: "success" },
         });
-        console.log(`✅ Human answered for alert ${action.alertId}`);
+        console.log(`✅ Call completed with human answer for alert ${action.alertId}`);
         return res.sendStatus(200);
       }
 
+      // Appel terminé sans réponse humaine → retry
       await db.alertAction.update({
         where: { id: action.id },
         data: { outcome: "completed-no-human" },
       });
 
-      // Compte uniquement les vrais appels (exclut les marqueurs internes)
       const attemptCount = await db.alertAction.count({
         where: {
           alertId: action.alertId,
@@ -199,13 +191,13 @@ router.post("/call-status", async (req: Request, res: Response) => {
       return res.sendStatus(200);
     }
 
+    // ── PAS DE RÉPONSE / OCCUPÉ / ÉCHEC ──────────────────────────────────────
     if (["busy", "no-answer", "canceled", "failed"].includes(CallStatus)) {
       await db.alertAction.update({
         where: { id: action.id },
         data: { outcome: CallStatus },
       });
 
-      // Compte uniquement les vrais appels (exclut les marqueurs internes)
       const attemptCount = await db.alertAction.count({
         where: {
           alertId: action.alertId,
@@ -218,19 +210,22 @@ router.post("/call-status", async (req: Request, res: Response) => {
       return res.sendStatus(200);
     }
 
+    // Statut inconnu
     await db.alertAction.update({
       where: { id: action.id },
       data: { outcome: String(CallStatus ?? "unknown") },
     });
-
     return res.sendStatus(200);
+
   } catch (err) {
-    console.error("❌ call-status error:", err);
+    console.error("❌ /twilio/call-status error:", err);
     return res.sendStatus(500);
   }
 });
 
 // ─── POST /twilio/amd-status ──────────────────────────────────────────────────
+// AMD = détection répondeur. Utile pour les logs mais ne contrôle plus
+// humanAnswered (c'est "in-progress" qui le fait maintenant).
 
 router.post("/amd-status", async (req: Request, res: Response) => {
   try {
@@ -246,40 +241,21 @@ router.post("/amd-status", async (req: Request, res: Response) => {
     });
 
     if (!action) {
-      console.warn("⚠️ No action found for AMD CallSid:", CallSid);
+      console.warn("⚠️ No AlertAction for AMD CallSid:", CallSid);
       return res.sendStatus(200);
     }
 
-    if (AnsweredBy === "human") {
-      await db.alertAction.update({
-        where: { id: action.id },
-        data: { humanAnswered: true, outcome: "in-progress" },
-      });
-      console.log(`✅ Human detected for alert ${action.alertId}`);
-    } else if (
-      [
-        "machine_start",
-        "machine_end_beep",
-        "machine_end_silence",
-        "machine_end_other",
-        "fax",
-      ].includes(String(AnsweredBy))
-    ) {
-      await db.alertAction.update({
-        where: { id: action.id },
-        data: { humanAnswered: false, outcome: "machine" },
-      });
-      console.log(`🤖 Machine detected for alert ${action.alertId}`);
-    } else {
-      await db.alertAction.update({
-        where: { id: action.id },
-        data: { outcome: String(AnsweredBy ?? "unknown") },
-      });
-    }
+    // Sauvegarde le résultat AMD pour les logs — ne touche pas humanAnswered
+    await db.alertAction.update({
+      where: { id: action.id },
+      data: { amdResult: AnsweredBy ?? "unknown" },
+    });
 
+    console.log(`🧠 AMD result saved: ${AnsweredBy} for alert ${action.alertId}`);
     return res.sendStatus(200);
+
   } catch (err) {
-    console.error("❌ amd-status error:", err);
+    console.error("❌ /twilio/amd-status error:", err);
     return res.sendStatus(500);
   }
 });
@@ -300,10 +276,11 @@ router.post("/sms-status", async (req: Request, res: Response) => {
       data: { outcome: MessageStatus },
     });
 
-    console.log(`📩 SMS updated for ${result.count} action(s)`);
+    console.log(`📩 SMS status updated for ${result.count} action(s)`);
     return res.sendStatus(200);
+
   } catch (err) {
-    console.error("❌ sms-status error:", err);
+    console.error("❌ /twilio/sms-status error:", err);
     return res.sendStatus(500);
   }
 });

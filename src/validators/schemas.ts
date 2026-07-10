@@ -38,6 +38,7 @@ export const registerUserSchema = z.object({
   firstName: z.string().trim().min(1).max(50),
   address: z.string().trim().max(200).optional().default(""),
   city: z.string().trim().max(100).optional().default(""),
+  province: z.string().trim().max(100).optional().default(""),
   country: z.string().trim().max(100).optional().default(""),
   zipCode: z.string().trim().max(20).optional().default(""),
   emergencyContact: emergencyContactSchema,

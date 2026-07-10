@@ -17,6 +17,7 @@ model User {
   firstName            String?
   address              String     @default("")
   city                 String     @default("")
+  province             String     @default("")
   country              String     @default("")
   zipCode              String     @default("")
   fcmToken             String?
