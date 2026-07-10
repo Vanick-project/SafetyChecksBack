@@ -34,7 +34,9 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: "Too many requests. Try again in 15 minutes." },
   skip: (req) =>
-    req.path.startsWith("/twilio") || req.path.startsWith("/twiml"),
+    req.path.startsWith("/twilio") ||
+    req.path.startsWith("/twiml") ||
+    req.path.startsWith("/alerts/active"), // ← poll d'alerte : limiteur dédié plus bas
 });
 app.use(apiLimiter);
 
@@ -44,6 +46,17 @@ const sosLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many SOS alerts. Please contact support." },
+});
+
+// Limiteur dédié au polling de l'alerte active.
+// AlertScreen poll pendant toute la durée de l'alerte → budget large.
+// 300 req / 5 min / IP = 60/min, couvre plusieurs clients à 3-5s sans bloquer.
+const alertPollLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many alert status checks." },
 });
 
 // Limite anti-spam pour le formulaire de contact — 5 messages / heure / IP
@@ -62,6 +75,7 @@ app.get("/health", (_req, res) => {
 app.use("/users", usersRouter);
 app.use("/checkins", checkInRouter);
 app.use("/alerts/trigger", sosLimiter);
+app.use("/alerts/active", alertPollLimiter);
 app.use("/alerts", alertRouter);
 app.use("/twiml", twimlRouter);
 app.use("/twilio", twilioWebhookRouter);
