@@ -300,6 +300,7 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
       return;
     }
 
+    
     // SUCCÈS : un humain a été joint → aucun retry, aucune escalade.
     if (humanReached) {
       console.log(`✅ Humain joint pour ${alertId} — aucun retry.`);
@@ -311,6 +312,18 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
           outcome: "answered_human",
         },
       });
+
+      // Marque l'action "System action" (PUSH/system) comme terminée avec succès.
+      // L'alerte reste ACTIVE : seul le "I'm safe" de l'utilisateur la résout (option B).
+      await db.alertAction.updateMany({
+        where: {
+          alertId,
+          actionType: "PUSH",
+          destination: "system",
+        },
+        data: { outcome: "contact_reached_success" },
+      });
+
       return;
     }
 
