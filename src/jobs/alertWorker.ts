@@ -96,6 +96,22 @@ export const alertWorker = new Worker(
           `🛑 Max call attempts (${MAX_CALL_ATTEMPTS}) reached for alert ${alertId} — marking FAILED`,
         );
 
+        // Escalade SMS (idempotent) : on n'a pas pu joindre le contact par appel.
+        const alreadyEscalated = await db.alertAction.findFirst({
+          where: { alertId, destination: "escalation" },
+        });
+        if (!alreadyEscalated) {
+          try {
+            await sendEscalationSMS(alertId);
+            console.log(`📱 Escalation SMS sent for alert ${alertId}`);
+          } catch (err) {
+            console.error(
+              `❌ Escalation SMS failed for alert ${alertId}:`,
+              err instanceof Error ? err.message : err,
+            );
+          }
+        }
+
         await db.alertEvent.update({
           where: { id: alertId },
           data: { status: "FAILED" },

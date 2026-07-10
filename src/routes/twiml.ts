@@ -1,11 +1,28 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
+import { Queue } from "bullmq";
+import twilio from "twilio";
 import { db } from "../db/client.js";
+import { redisConnection } from "../lib/redis.js";
 
 export const twimlRouter = Router();
 console.log("✅ twimlRouter loaded");
 
 const BASE_URL = process.env.API_BASE_URL!;
+
+// ─── FILE BULLMQ (producteur) ─────────────────────────────────────────────────
+// Même nom + même connexion que le Worker de alertWorker.ts → même file.
+// Instance producteur autonome : pas besoin d'importer une file définie ailleurs.
+const alertQueue = new Queue("alertQueue", { connection: redisConnection });
+
+// Délai entre deux tentatives d'appel. (Déplaçable dans config/constants.ts.)
+const RETRY_DELAY_MS = 30_000;
+
+// Client Twilio, uniquement pour raccrocher un répondeur détecté par AMD.
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID!,
+  process.env.TWILIO_AUTH_TOKEN!,
+);
 
 // ─── HELPER ──────────────────────────────────────────────────────────────────
 // Twilio peut envoyer le même param dans query ET body simultanément
@@ -161,48 +178,121 @@ twimlRouter.post("/gather", async (req: Request, res: Response) => {
 });
 
 // ─── AMD CALLBACK ────────────────────────────────────────────────────────────
+// Reçoit le verdict AMD (human | machine_* | fax | unknown).
+// Écrit amdResult, et si c'est un répondeur CONFIRMÉ, raccroche tout de suite
+// pour ne pas attendre 39 s : le /call-status "completed" qui suit planifiera
+// la tentative suivante.
 
 twimlRouter.post("/amd-callback", async (req: Request, res: Response) => {
-  const { CallSid, AnsweredBy } = req.body as {
-    CallSid?: string;
-    AnsweredBy?: string;
-  };
+  const CallSid = param(req.body.CallSid);
+  const AnsweredBy = param(req.body.AnsweredBy);
   console.log(`🤖 AMD — ${CallSid}: ${AnsweredBy}`);
-  if (CallSid) {
-    try {
-      await db.alertAction.updateMany({
-        where: { providerSid: CallSid },
-        data: { amdResult: AnsweredBy ?? "unknown" },
-      });
-    } catch (e) {
-      console.error("AMD DB error:", e);
+
+  res.sendStatus(204); // ack rapide à Twilio ; le reste est best-effort
+  if (!CallSid) return;
+
+  try {
+    await db.alertAction.updateMany({
+      where: { providerSid: CallSid },
+      data: { amdResult: AnsweredBy || "unknown" },
+    });
+
+    // On ne raccroche que sur un répondeur CONFIRMÉ (pas "unknown", pour ne pas
+    // couper un vrai humain qu'AMD n'aurait pas su classer).
+    const confirmedMachine =
+      AnsweredBy.startsWith("machine") || AnsweredBy === "fax";
+
+    if (confirmedMachine) {
+      await twilioClient
+        .calls(CallSid)
+        .update({ status: "completed" })
+        .catch(() => {});
+      console.log(
+        `📭 Répondeur détecté (${AnsweredBy}) — appel raccroché, retry à venir.`,
+      );
     }
+  } catch (e) {
+    console.error("AMD DB error:", e);
   }
-  res.sendStatus(204);
 });
 
 // ─── CALL STATUS ─────────────────────────────────────────────────────────────
+// Source unique de décision retry/succès. Reçoit le statut final de chaque appel.
+//   - AMD = "human"           → contact joint, aucun retry (l'alerte reste ACTIVE
+//                               jusqu'au "I'm safe" de l'utilisateur).
+//   - répondeur / no-answer / busy / failed → planifie retryEmergencyCall.
+// C'est le worker (alertWorker.ts) qui, au bout de MAX_CALL_ATTEMPTS, passe
+// l'alerte à FAILED et envoie l'escalade SMS.
 
 twimlRouter.post("/call-status", async (req: Request, res: Response) => {
-  const { CallSid, CallStatus, CallDuration } = req.body as {
-    CallSid?: string;
-    CallStatus?: string;
-    CallDuration?: string;
-  };
-  console.log(`📞 ${CallSid}: ${CallStatus} ${CallDuration ?? "?"}s`);
-  if (CallSid) {
-    try {
-      await db.alertAction.updateMany({
-        where: { providerSid: CallSid },
-        data: {
-          callStatus: CallStatus ?? null,
-          callDuration: CallDuration ? parseInt(CallDuration, 10) : null,
-          ...(CallStatus !== undefined && { outcome: CallStatus }),
-        },
-      });
-    } catch (e) {
-      console.error("call-status DB error:", e);
+  const CallSid = param(req.body.CallSid);
+  const CallStatus = param(req.body.CallStatus);
+  const CallDuration = param(req.body.CallDuration);
+
+  console.log(`📞 ${CallSid}: ${CallStatus} ${CallDuration || "?"}s`);
+
+  res.sendStatus(204); // ack rapide à Twilio
+  if (!CallSid) return;
+
+  try {
+    const action = await db.alertAction.findFirst({
+      where: { providerSid: CallSid },
+    });
+    if (!action) return;
+
+    // Écrit le statut final de l'appel (comportement conservé)
+    await db.alertAction.update({
+      where: { id: action.id },
+      data: {
+        callStatus: CallStatus || null,
+        callDuration: CallDuration ? parseInt(CallDuration, 10) : null,
+        outcome: CallStatus || action.outcome,
+      },
+    });
+
+    // On ne réagit qu'aux états terminaux
+    const terminal = ["completed", "busy", "no-answer", "failed", "canceled"];
+    if (!terminal.includes(CallStatus)) return;
+
+    const alertId = action.alertId;
+    if (!alertId) return;
+
+    // Ne pas relancer si l'alerte n'est plus active (résolue par "I'm safe",
+    // ou déjà passée à FAILED).
+    const alert = await db.alertEvent.findUnique({ where: { id: alertId } });
+    if (!alert || alert.status !== "ACTIVE") {
+      console.log(
+        `⏹️ Alerte ${alertId} non-active (${alert?.status ?? "introuvable"}) — pas de retry.`,
+      );
+      return;
     }
+
+    // Un humain a décroché → contact joint. On arrête les appels.
+    if (CallStatus === "completed" && action.amdResult === "human") {
+      console.log(`✅ Humain joint pour ${alertId} — aucun retry.`);
+      await db.alertAction.update({
+        where: { id: action.id },
+        data: { outcome: "answered_human" },
+      });
+      return;
+    }
+
+    // Sinon (répondeur, sans réponse, occupé, échec) → tentative suivante.
+    await alertQueue.add(
+      "retryEmergencyCall",
+      { alertId },
+      {
+        delay: RETRY_DELAY_MS,
+        jobId: `retry-${CallSid}`, // dédup si Twilio renvoie le même webhook
+        removeOnComplete: true,
+        removeOnFail: true,
+      },
+    );
+    console.log(
+      `🔁 Retry planifié pour ${alertId} dans ${RETRY_DELAY_MS / 1000}s ` +
+        `— cause: ${CallStatus}/${action.amdResult ?? "no-amd"}`,
+    );
+  } catch (e) {
+    console.error("call-status error:", e);
   }
-  res.sendStatus(204);
 });
