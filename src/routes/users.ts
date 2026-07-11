@@ -42,10 +42,29 @@ router.post("/register", async (req: Request, res: Response) => {
       emergencyContact, checkInIntervalHours, language,
     } = parsed;
 
+    // L'onboarding = check-in par INTERVALLE simple. On réécrit TOUT le schedule
+    // pour écraser un schedule avancé laissé par une installation précédente,
+    // et on remet lastCheckInAt à maintenant → le compte à rebours repart à zéro.
+    const onboardingSchedule = {
+      checkInIntervalHours,
+      scheduleType: "interval" as const,
+      scheduleIntervalHours: checkInIntervalHours ?? 24,
+      scheduleIntervalMinutes: 0,
+      lastCheckInAt: new Date(),
+    };
+
     const user = await db.user.upsert({
       where: { phoneNumber },
-      update: { firstName, address, city, country, zipCode, province: province ?? "", checkInIntervalHours, language },
-      create: { phoneNumber, firstName, address, city, country, zipCode, province: province ?? "", checkInIntervalHours, language },
+      update: {
+        firstName, address, city, country, zipCode,
+        province: province ?? "", language,
+        ...onboardingSchedule,
+      },
+      create: {
+        phoneNumber, firstName, address, city, country, zipCode,
+        province: province ?? "", language,
+        ...onboardingSchedule,
+      },
     });
 
     await db.emergencyContact.upsert({
