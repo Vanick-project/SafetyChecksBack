@@ -29,6 +29,7 @@ model User {
   updatedAt            DateTime   @updatedAt
   lastCheckInAt        DateTime?
   language             String     @default("fr")
+  timezone String?
   alertChannel         String     @default("sms")
   alertSystemEnabled   Boolean    @default(true)
   notificationsEnabled Boolean    @default(true)

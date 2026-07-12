@@ -1,6 +1,8 @@
 // ─── src/routes/users.ts ─────────────────────────────────────────────────────
 //
 // AJOUT : PATCH /users/schedule — sauvegarde la config de schedule avancé.
+// AJOUT : persistance de `timezone` (IANA) dans /register, /checkin-interval
+//         et /schedule → nécessaire au calcul weekly/monthly côté serveur.
 
 import { Router } from "express";
 import type { Request, Response } from "express";
@@ -31,6 +33,7 @@ const updateScheduleSchema = z.object({
   scheduleDayOfMonth: z.number().int().min(1).max(31).optional(),
   scheduleTimeHour: z.number().int().min(0).max(23).optional(),
   scheduleTimeMinute: z.number().int().min(0).max(59).optional(),
+  timezone: z.string().optional(),
 });
 
 // POST /users/register
@@ -39,18 +42,21 @@ router.post("/register", async (req: Request, res: Response) => {
     const parsed = registerUserSchema.parse(req.body);
     const {
       phoneNumber, firstName, address, city, country, zipCode, province,
-      emergencyContact, checkInIntervalHours, language,
+      emergencyContact, checkInIntervalHours, language, timezone,
     } = parsed;
 
     // L'onboarding = check-in par INTERVALLE simple. On réécrit TOUT le schedule
     // pour écraser un schedule avancé laissé par une installation précédente,
     // et on remet lastCheckInAt à maintenant → le compte à rebours repart à zéro.
+    // On stocke aussi le fuseau : inutile en interval, mais prêt si l'utilisateur
+    // passe ensuite en weekly/monthly.
     const onboardingSchedule = {
       checkInIntervalHours,
       scheduleType: "interval" as const,
       scheduleIntervalHours: checkInIntervalHours ?? 24,
       scheduleIntervalMinutes: 0,
       lastCheckInAt: new Date(),
+      ...(timezone && { timezone }),
     };
 
     const user = await db.user.upsert({
@@ -147,7 +153,7 @@ router.patch("/location", async (req: Request, res: Response) => {
 router.patch("/checkin-interval", async (req: Request, res: Response) => {
   try {
     const parsed = updateCheckInIntervalSchema.parse(req.body);
-    const { userId, intervalHours } = parsed;
+    const { userId, intervalHours, timezone } = parsed;
     const user = await db.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
     await db.user.update({
@@ -158,6 +164,7 @@ router.patch("/checkin-interval", async (req: Request, res: Response) => {
         scheduleIntervalHours: intervalHours,
         scheduleIntervalMinutes: 0,
         lastCheckInAt: new Date(),
+        ...(timezone && { timezone }),
       },
     });
     await scheduleCheckIn(userId);
@@ -170,11 +177,11 @@ router.patch("/checkin-interval", async (req: Request, res: Response) => {
   }
 });
 
-// PATCH /users/schedule — NOUVEAU endpoint pour le schedule avancé
+// PATCH /users/schedule — endpoint pour le schedule avancé
 router.patch("/schedule", async (req: Request, res: Response) => {
   try {
     const parsed = updateScheduleSchema.parse(req.body);
-    const { userId, scheduleType, ...scheduleFields } = parsed;
+    const { userId, scheduleType, timezone, ...scheduleFields } = parsed;
 
     const user = await db.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
@@ -203,6 +210,7 @@ router.patch("/schedule", async (req: Request, res: Response) => {
         ...(scheduleFields.scheduleTimeMinute !== undefined && {
           scheduleTimeMinute: scheduleFields.scheduleTimeMinute,
         }),
+        ...(timezone && { timezone }),
         lastCheckInAt: new Date(),
       },
     });

@@ -1,12 +1,17 @@
 // ─── src/jobs/checkin-scheduler.ts ───────────────────────────────────────────
 // CHANGEMENTS vs version précédente :
-//   - scheduleCheckIn lit checkInIntervalHours depuis la DB au lieu d'utiliser
-//     TWENTY_FOUR_HOURS fixe. Défaut : 24h si non configuré.
-//   - FIVE_MINUTES entre les rappels, MAX_REMINDERS = 5 (inchangé).
-//   - triggerReason mis à jour → NO_RESPONSE_AFTER_5_REMINDERS.
+//   - scheduleCheckIn gère les 3 modes (interval | weekly | monthly), en
+//     miroir de getNextCheckInMs du HomeScreen → affichage et déclenchement
+//     restent cohérents.
+//   - weekly/monthly sont calculés dans le FUSEAU de l'utilisateur (champ
+//     User.timezone, IANA, ex "America/Toronto") via luxon → gère aussi le DST.
+//     Fallback "UTC" si le fuseau n'est pas connu.
+//   - interval reste une pure durée depuis lastCheckInAt (indépendant du fuseau).
+//   - FIVE_MINUTES entre les rappels, MAX_REMINDERS = 3.
 
 import { Queue, Worker, Job } from "bullmq";
 import { Redis } from "ioredis";
+import { DateTime } from "luxon";
 import { sendCheckInNotification } from "../services/fcm.js";
 import { db } from "../db/client.js";
 import { alertQueue } from "./alertQueue.js";
@@ -32,20 +37,82 @@ export const checkInQueue: Queue | null = connection
   ? new Queue("check-in", { connection })
   : null;
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
+// ─── CALCUL DU PROCHAIN CHECK-IN ──────────────────────────────────────────────
+// Retourne le nombre de millisecondes jusqu'au prochain check-in.
+// Reproduit exactement getNextCheckInMs du HomeScreen, mais côté serveur et
+// dans le fuseau de l'utilisateur pour weekly/monthly.
 
-/**
- * Retourne l'intervalle de check-in de l'utilisateur en millisecondes.
- * Lit checkInIntervalHours depuis la DB. Défaut : 24h.
- */
-async function getUserIntervalMs(userId: string): Promise<number> {
+async function computeNextDelayMs(userId: string): Promise<number> {
   const user = await db.user.findUnique({
     where: { id: userId },
-    select: { checkInIntervalHours: true },
+    select: {
+      checkInIntervalHours: true,
+      scheduleType: true,
+      scheduleIntervalHours: true,
+      scheduleIntervalMinutes: true,
+      scheduleDayOfWeek: true,
+      scheduleDayOfMonth: true,
+      scheduleTimeHour: true,
+      scheduleTimeMinute: true,
+      lastCheckInAt: true,
+      createdAt: true,
+      timezone: true,
+    },
   });
 
-  const hours = user?.checkInIntervalHours ?? 24;
-  return hours * 60 * 60 * 1000;
+  const DEFAULT_HOURS = 24;
+  if (!user) return DEFAULT_HOURS * 60 * 60 * 1000;
+
+  const type = user.scheduleType ?? "interval";
+
+  // ── INTERVAL : pure durée depuis lastCheckInAt → indépendant du fuseau ──
+  if (type === "interval") {
+    const base = (user.lastCheckInAt ?? user.createdAt ?? new Date()).getTime();
+    const h =
+      user.scheduleIntervalHours ??
+      user.checkInIntervalHours ??
+      DEFAULT_HOURS;
+    const m = user.scheduleIntervalMinutes ?? 0;
+    const next = base + (h * 60 + m) * 60 * 1000;
+    return Math.max(0, next - Date.now());
+  }
+
+  // ── WEEKLY / MONTHLY : ancrés sur une heure murale → dépend du fuseau ──
+  const zone = user.timezone || "UTC";
+  const nowLocal = DateTime.now().setZone(zone);
+  const timeH = user.scheduleTimeHour ?? 9;
+  const timeM = user.scheduleTimeMinute ?? 0;
+
+  if (type === "weekly") {
+    // scheduleDayOfWeek : 0=dimanche..6=samedi (convention JS, comme le HomeScreen)
+    const targetDowJs = user.scheduleDayOfWeek ?? 1;
+    // luxon weekday : 1=lundi..7=dimanche → %7 donne dim=0..sam=6 (= getDay JS)
+    const nowDowJs = nowLocal.weekday % 7;
+    const daysUntil = ((targetDowJs - nowDowJs + 7) % 7) || 7;
+    const next = nowLocal
+      .plus({ days: daysUntil })
+      .set({ hour: timeH, minute: timeM, second: 0, millisecond: 0 });
+    return Math.max(0, next.toMillis() - nowLocal.toMillis());
+  }
+
+  if (type === "monthly") {
+    const rawDom = user.scheduleDayOfMonth ?? 1;
+    let next = nowLocal.set({
+      hour: timeH,
+      minute: timeM,
+      second: 0,
+      millisecond: 0,
+    });
+    // clamp au dernier jour du mois (ex : 31 en février → 28/29)
+    next = next.set({ day: Math.min(rawDom, next.daysInMonth ?? 28) });
+    if (next <= nowLocal) {
+      const nm = next.plus({ months: 1 });
+      next = nm.set({ day: Math.min(rawDom, nm.daysInMonth ?? 28) });
+    }
+    return Math.max(0, next.toMillis() - nowLocal.toMillis());
+  }
+
+  return DEFAULT_HOURS * 60 * 60 * 1000;
 }
 
 // ─── SCHEDULE ────────────────────────────────────────────────────────────────
@@ -62,27 +129,28 @@ export async function scheduleCheckIn(userId: string) {
     checkInQueue.getJob(`checkin-reminder-${userId}`), // legacy
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-2`),
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-3`),
-    // attempt-4 retiré — MAX_REMINDERS = 3
-    // attempt-5 retiré — MAX_REMINDERS = 3
     checkInQueue.getJob(`auto-sos-${userId}`),
   ]);
   await Promise.all(jobsToCancel.map((j) => j?.remove()));
 
-  // Lit l'intervalle personnalisé de l'utilisateur depuis la DB.
-  const intervalMs = await getUserIntervalMs(userId);
-  const intervalHours = intervalMs / (60 * 60 * 1000);
+  // Délai jusqu'au prochain check-in selon le mode (interval/weekly/monthly).
+  const delayMs = await computeNextDelayMs(userId);
 
   await checkInQueue.add(
     "send-check-in",
     { userId, attempt: 1 },
     {
       jobId: `checkin-${userId}`,
-      delay: intervalMs,
+      delay: delayMs,
       removeOnComplete: true,
     },
   );
 
-  console.log(`⏰ Check-in scheduled in ${intervalHours}h for user ${userId}`);
+  const mins = Math.round(delayMs / 60000);
+  const hrs = (delayMs / 3600000).toFixed(1);
+  console.log(
+    `⏰ Check-in scheduled in ~${mins} min (${hrs}h) for user ${userId}`,
+  );
 }
 
 export async function rescheduleAfterOk(userId: string) {
@@ -117,17 +185,12 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
     return;
   }
 
-  // NOUVEAU — système désactivé par l'utilisateur
+  // Système désactivé par l'utilisateur
   if (user.alertSystemEnabled === false) {
     console.log(
       `⏸️ Alert system disabled for user ${userId} — skipping auto SOS`,
     );
     await scheduleCheckIn(userId);
-    return;
-  }
-
-  if (!user.emergencyContact) {
-    console.warn(`⚠️ User ${userId} has no emergency contact — cannot SOS`);
     return;
   }
 
@@ -144,7 +207,7 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
   const alert = await db.alertEvent.create({
     data: {
       userId,
-      triggerReason: "NO_RESPONSE_AFTER_5_REMINDERS",
+      triggerReason: "NO_RESPONSE_AFTER_3_REMINDERS",
       triggeredAt: new Date(),
       status: "ACTIVE",
       ...(user.lastLat != null && { latAtTrigger: user.lastLat }),
@@ -230,14 +293,11 @@ if (connection) {
         );
 
         if (attempt < MAX_REMINDERS) {
-          // Annule l'ancien reminder s'il existe encore
           const reminderJob = await checkInQueue.getJob(
             `checkin-reminder-${userId}`,
           );
           await reminderJob?.remove();
 
-          // jobId unique par attempt — évite le conflit BullMQ qui ignorait
-          // silencieusement le job si l'ID existait déjà
           await checkInQueue.add(
             "send-check-in",
             { userId, attempt: attempt + 1 },
@@ -293,14 +353,11 @@ export async function handleUserResponse(
     return;
   }
 
-  // Annule le job principal + tous les reminders possibles (attempt 2→5) + autoSos
   const jobsToCancel = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
     checkInQueue.getJob(`checkin-reminder-${userId}`), // legacy
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-2`),
     checkInQueue.getJob(`checkin-reminder-${userId}-attempt-3`),
-    // attempt-4 retiré — MAX_REMINDERS = 3
-    // attempt-5 retiré — MAX_REMINDERS = 3
     checkInQueue.getJob(`auto-sos-${userId}`),
   ]);
   await Promise.all(jobsToCancel.map((j) => j?.remove()));
