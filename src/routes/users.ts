@@ -34,6 +34,7 @@ const updateScheduleSchema = z.object({
   scheduleTimeHour: z.number().int().min(0).max(23).optional(),
   scheduleTimeMinute: z.number().int().min(0).max(59).optional(),
   timezone: z.string().optional(),
+  recurring: z.boolean().optional(),
 });
 
 // POST /users/register
@@ -42,7 +43,7 @@ router.post("/register", async (req: Request, res: Response) => {
     const parsed = registerUserSchema.parse(req.body);
     const {
       phoneNumber, firstName, address, city, country, zipCode, province,
-      emergencyContact, checkInIntervalHours, language, timezone,
+      emergencyContact, checkInIntervalHours, language, timezone, recurring,
     } = parsed;
 
     // L'onboarding = check-in par INTERVALLE simple. On réécrit TOUT le schedule
@@ -56,7 +57,9 @@ router.post("/register", async (req: Request, res: Response) => {
       scheduleIntervalHours: checkInIntervalHours ?? 24,
       scheduleIntervalMinutes: 0,
       lastCheckInAt: new Date(),
+      checkInActive: true,
       ...(timezone && { timezone }),
+      ...(recurring !== undefined && { recurring }),
     };
 
     const user = await db.user.upsert({
@@ -153,7 +156,9 @@ router.patch("/location", async (req: Request, res: Response) => {
 router.patch("/checkin-interval", async (req: Request, res: Response) => {
   try {
     const parsed = updateCheckInIntervalSchema.parse(req.body);
-    const { userId, intervalHours, timezone } = parsed;
+    const { userId, intervalHours, timezone, recurring } = parsed as {
+      userId: string; intervalHours: number; timezone?: string; recurring?: boolean;
+    };
     const user = await db.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
     await db.user.update({
@@ -164,7 +169,9 @@ router.patch("/checkin-interval", async (req: Request, res: Response) => {
         scheduleIntervalHours: intervalHours,
         scheduleIntervalMinutes: 0,
         lastCheckInAt: new Date(),
+        checkInActive: true,
         ...(timezone && { timezone }),
+        ...(recurring !== undefined && { recurring }),
       },
     });
     await scheduleCheckIn(userId);
@@ -181,7 +188,7 @@ router.patch("/checkin-interval", async (req: Request, res: Response) => {
 router.patch("/schedule", async (req: Request, res: Response) => {
   try {
     const parsed = updateScheduleSchema.parse(req.body);
-    const { userId, scheduleType, timezone, ...scheduleFields } = parsed;
+    const { userId, scheduleType, timezone, recurring, ...scheduleFields } = parsed;
 
     const user = await db.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
@@ -211,6 +218,9 @@ router.patch("/schedule", async (req: Request, res: Response) => {
           scheduleTimeMinute: scheduleFields.scheduleTimeMinute,
         }),
         ...(timezone && { timezone }),
+        ...(recurring !== undefined && { recurring }),
+        // Un nouveau réglage réactive toujours le cycle de check-in.
+        checkInActive: true,
         lastCheckInAt: new Date(),
       },
     });

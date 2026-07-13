@@ -52,7 +52,8 @@ export const registerUserSchema = z.object({
     .optional()
     .default(24),
   language: z.enum(["fr", "en"]).optional().default("fr"),
-  timezone: z.string().optional()
+  timezone: z.string().optional(),
+  recurring: z.boolean().optional(),
 });
 
 export const updateEmergencyContactSchema = z.object({
@@ -99,7 +100,8 @@ export const updateCheckInIntervalSchema = z.object({
       message: "intervalHours must be one of: 1, 2, 4, 8, 12, 24",
     }),
   ]),
-  timezone: z.string().optional()
+  timezone: z.string().optional(),
+  recurring: z.boolean().optional(),
 });
 
 export const updateAlertSettingsSchema = z.object({

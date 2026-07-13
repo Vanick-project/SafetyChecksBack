@@ -7,7 +7,10 @@
 //     User.timezone, IANA, ex "America/Toronto") via luxon → gère aussi le DST.
 //     Fallback "UTC" si le fuseau n'est pas connu.
 //   - interval reste une pure durée depuis lastCheckInAt (indépendant du fuseau).
-//   - FIVE_MINUTES entre les rappels, MAX_REMINDERS = 3.
+//   - Cadence de rappels ADAPTATIVE : 2 min si intervalle < 30 min, 5 min sinon.
+//   - Récurrence (User.recurring) : si false, arrêt du cycle après une réponse OK
+//     (checkInActive=false). L'auto-SOS en cas de non-réponse reste toujours actif.
+//   - Plancher d'intervalle : 15 min. MAX_REMINDERS = 3.
 
 import { Queue, Worker, Job } from "bullmq";
 import { Redis } from "ioredis";
@@ -15,7 +18,44 @@ import { DateTime } from "luxon";
 import { sendCheckInNotification } from "../services/fcm.js";
 import { db } from "../db/client.js";
 import { alertQueue } from "./alertQueue.js";
-import { FIVE_MINUTES, MAX_REMINDERS } from "../config/constants.js";
+import { MAX_REMINDERS } from "../config/constants.js";
+
+// ─── CADENCE DES RAPPELS ──────────────────────────────────────────────────────
+const NORMAL_REMINDER_MS = 5 * 60 * 1000; // intervalle >= 30 min, weekly, monthly
+const CLOSE_REMINDER_MS = 2 * 60 * 1000;  // intervalle court : 15-29 min
+const SHORT_INTERVAL_THRESHOLD_MIN = 30;  // en-dessous -> cadence rapprochee
+const MIN_INTERVAL_MIN = 15;              // plancher absolu
+
+// Duree totale de l'intervalle en minutes (interval only ; grande valeur sinon).
+function intervalTotalMinutes(u: {
+  scheduleType: string | null;
+  scheduleIntervalHours: number | null;
+  scheduleIntervalMinutes: number | null;
+  checkInIntervalHours: number | null;
+}): number {
+  const type = u.scheduleType ?? "interval";
+  if (type !== "interval") return Number.MAX_SAFE_INTEGER;
+  const h = u.scheduleIntervalHours ?? u.checkInIntervalHours ?? 24;
+  const m = u.scheduleIntervalMinutes ?? 0;
+  return Math.max(MIN_INTERVAL_MIN, h * 60 + m);
+}
+
+// Cadence de rappel pour un utilisateur (2 min si court, 5 min sinon).
+async function reminderDelayMs(userId: string): Promise<number> {
+  const u = await db.user.findUnique({
+    where: { id: userId },
+    select: {
+      scheduleType: true,
+      scheduleIntervalHours: true,
+      scheduleIntervalMinutes: true,
+      checkInIntervalHours: true,
+    },
+  });
+  if (!u) return NORMAL_REMINDER_MS;
+  return intervalTotalMinutes(u) < SHORT_INTERVAL_THRESHOLD_MIN
+    ? CLOSE_REMINDER_MS
+    : NORMAL_REMINDER_MS;
+}
 
 // ─── REDIS ───────────────────────────────────────────────────────────────────
 
@@ -68,12 +108,11 @@ async function computeNextDelayMs(userId: string): Promise<number> {
   // ── INTERVAL : pure durée depuis lastCheckInAt → indépendant du fuseau ──
   if (type === "interval") {
     const base = (user.lastCheckInAt ?? user.createdAt ?? new Date()).getTime();
-    const h =
-      user.scheduleIntervalHours ??
-      user.checkInIntervalHours ??
-      DEFAULT_HOURS;
-    const m = user.scheduleIntervalMinutes ?? 0;
-    const next = base + (h * 60 + m) * 60 * 1000;
+    const rawMin =
+      (user.scheduleIntervalHours ?? user.checkInIntervalHours ?? DEFAULT_HOURS) * 60 +
+      (user.scheduleIntervalMinutes ?? 0);
+    const totalMin = Math.max(MIN_INTERVAL_MIN, rawMin); // plancher 15 min
+    const next = base + totalMin * 60 * 1000;
     return Math.max(0, next - Date.now());
   }
 
@@ -146,6 +185,10 @@ export async function scheduleCheckIn(userId: string) {
     },
   );
 
+  await db.user
+    .update({ where: { id: userId }, data: { checkInActive: true } })
+    .catch(() => {});
+
   const mins = Math.round(delayMs / 60000);
   const hrs = (delayMs / 3600000).toFixed(1);
   console.log(
@@ -190,7 +233,11 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
     console.log(
       `⏸️ Alert system disabled for user ${userId} — skipping auto SOS`,
     );
-    await scheduleCheckIn(userId);
+    if (user.recurring !== false) {
+      await scheduleCheckIn(userId);
+    } else {
+      await db.user.update({ where: { id: userId }, data: { checkInActive: false } }).catch(() => {});
+    }
     return;
   }
 
@@ -231,7 +278,13 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
     { attempts: 1, removeOnComplete: 50, removeOnFail: 100 },
   );
 
-  await scheduleCheckIn(userId);
+  // Récurrent → on reprogramme ; non-récurrent → one-shot consommé, on arrête.
+  if (user.recurring !== false) {
+    await scheduleCheckIn(userId);
+  } else {
+    await db.user.update({ where: { id: userId }, data: { checkInActive: false } }).catch(() => {});
+    console.log(`⏹️ Non-recurring check-in consumed for user ${userId} — cycle stopped`);
+  }
 }
 
 // ─── WORKER ──────────────────────────────────────────────────────────────────
@@ -292,6 +345,10 @@ if (connection) {
           `🔔 Check-in sent to ${userId}, attempt ${attempt}/${MAX_REMINDERS}`,
         );
 
+        // Cadence adaptative : 2 min si intervalle court, 5 min sinon.
+        const delay = await reminderDelayMs(userId);
+        const delayMin = Math.round(delay / 60000);
+
         if (attempt < MAX_REMINDERS) {
           const reminderJob = await checkInQueue.getJob(
             `checkin-reminder-${userId}`,
@@ -303,13 +360,13 @@ if (connection) {
             { userId, attempt: attempt + 1 },
             {
               jobId: `checkin-reminder-${userId}-attempt-${attempt + 1}`,
-              delay: FIVE_MINUTES,
+              delay,
               removeOnComplete: true,
             },
           );
 
           console.log(
-            `⏳ Reminder ${attempt + 1}/${MAX_REMINDERS} in 5 min for user ${userId}`,
+            `⏳ Reminder ${attempt + 1}/${MAX_REMINDERS} in ${delayMin} min for user ${userId}`,
           );
           return;
         }
@@ -319,12 +376,12 @@ if (connection) {
           { userId, checkInId: checkIn.id },
           {
             jobId: `auto-sos-${userId}`,
-            delay: FIVE_MINUTES,
+            delay,
             removeOnComplete: true,
           },
         );
 
-        console.log(`🚨 Auto SOS scheduled in 5 min for user ${userId}`);
+        console.log(`🚨 Auto SOS scheduled in ${delayMin} min for user ${userId}`);
         return;
       }
 
@@ -370,6 +427,21 @@ export async function handleUserResponse(
   }
 
   if (response === "OK") {
+    const u = await db.user.findUnique({
+      where: { id: userId },
+      select: { recurring: true },
+    });
+
+    if (u?.recurring === false) {
+      // Non-récurrent : on s'arrête après ce OK (checkInActive=false → Home affiche "aucun check-in").
+      await db.user.update({
+        where: { id: userId },
+        data: { lastCheckInAt: new Date(), status: "ACTIVE", checkInActive: false },
+      });
+      console.log(`⏹️ Non-recurring OK for user ${userId} — no next check-in scheduled`);
+      return;
+    }
+
     await db.user.update({
       where: { id: userId },
       data: { lastCheckInAt: new Date(), status: "ACTIVE" },
@@ -414,6 +486,10 @@ export async function handleUserResponse(
       { attempts: 1, removeOnComplete: 50, removeOnFail: 100 },
     );
 
-    await scheduleCheckIn(userId);
+    if (user.recurring !== false) {
+      await scheduleCheckIn(userId);
+    } else {
+      await db.user.update({ where: { id: userId }, data: { checkInActive: false } }).catch(() => {});
+    }
   }
 }

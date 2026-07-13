@@ -33,6 +33,8 @@ model User {
   alertChannel         String     @default("sms")
   alertSystemEnabled   Boolean    @default(true)
   notificationsEnabled Boolean    @default(true)
+  recurring      Boolean @default(true)
+  checkInActive  Boolean @default(true)
 
   // ── Schedule avancé ──────────────────────────────────────────────────────
   // scheduleType : "interval" | "weekly" | "monthly"
