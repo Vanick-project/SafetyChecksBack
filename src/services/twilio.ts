@@ -31,7 +31,7 @@ function buildSMSBody(
       `Hello ${contactName},\n\n` +
       `This is SafetyCheck. We are contacting you on behalf of ${userName}. ` +
       `We are unable to confirm whether ${userName} is safe at this time. ` +
-      `Please call 911 for a wellness check` +
+      `Please call 911 if you are in the United States or Canada, or 112 if you are in the European Union, for a wellness check` +
       (mapsLink
         ? ` and review your private messages for his last known location.\n\nThank you.\n\n📍 ${mapsLink}`
         : `.\n\nThank you.`)
@@ -43,7 +43,7 @@ function buildSMSBody(
     `Bonjour ${contactName},\n\n` +
     `Ceci est SafetyCheck. Nous vous contactons au nom de ${userName}. ` +
     `Nous ne sommes pas en mesure de confirmer si ${userName} est en securite. ` +
-    `Veuillez appeler le 911 pour une verification de bien-etre` +
+    `Veuillez contacter immediatement le 911 si vous etes aux Etats-Unis ou au Canada, ou le 112 si vous etes dans l'Union europeenne, pour une verification de bien-etre` +
     (mapsLink
       ? ` et consulter vos messages prives pour sa derniere position connue.\n\nMerci.\n\n📍 ${mapsLink}`
       : `.\n\nMerci.`)
@@ -70,9 +70,14 @@ export async function sendEscalationSMS(alertId: string): Promise<void> {
   const channel = (user as any).alertChannel ?? "sms";
   const language = (user as any).language ?? "fr";
 
-  const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
+  // Coordonnées : celles figées à l'alerte, sinon fallback sur la dernière
+  // position connue de l'utilisateur (évite un SMS sans géoloc quand l'alerte
+  // a été créée avant que PATCH /users/location n'écrive lastLat/lastLng).
+  const lat = alert.latAtTrigger ?? user.lastLat ?? null;
+  const lng = alert.lngAtTrigger ?? user.lastLng ?? null;
+  const hasLocation = lat != null && lng != null;
   const mapsLink = hasLocation
-    ? `https://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}`
+    ? `https://www.google.com/maps?q=${lat},${lng}`
     : null;
 
   const body = buildSMSBody(contactName, userName, mapsLink, language);
@@ -147,9 +152,12 @@ export async function sendLocationSMS(alertId: string): Promise<string> {
   const contactName = contact.name;
   const language = (user as any).language ?? "fr";
 
-  const hasLocation = alert.latAtTrigger != null && alert.lngAtTrigger != null;
+  // Fallback : coordonnées de l'alerte, sinon dernière position connue.
+  const lat = alert.latAtTrigger ?? user.lastLat ?? null;
+  const lng = alert.lngAtTrigger ?? user.lastLng ?? null;
+  const hasLocation = lat != null && lng != null;
   const mapsLink = hasLocation
-    ? `https://www.google.com/maps?q=${alert.latAtTrigger},${alert.lngAtTrigger}`
+    ? `https://www.google.com/maps?q=${lat},${lng}`
     : null;
 
   const body = buildSMSBody(contactName, userName, mapsLink, language);

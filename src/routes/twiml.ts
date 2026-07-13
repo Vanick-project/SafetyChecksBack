@@ -51,30 +51,30 @@ function twimlLang(lang: "fr" | "en") {
   return lang === "fr" ? "fr-FR" : "en-US";
 }
 
-function buildSpeechFr(name: string, hasLocation: boolean): string {
-  const loc = hasLocation
-    ? "Leur derniere position a ete envoyee par SMS."
-    : "Leur position est inconnue.";
+function buildSpeechFr(contactName: string, userName: string): string {
   return [
-    "Bonjour.",
-    "Ceci est une alerte de Safety Check.",
-    name + " ne repond pas a ses verifications de securite.",
-    loc + " Contactez-les immediatement.",
-    "Si vous ne pouvez pas les joindre, appelez le neuf-un-un.",
+    "Bonjour " + contactName + ".",
+    "Ici Safety Check.",
+    "Nous vous contactons au nom de " + userName + ".",
+    "A l'heure actuelle, nous ne sommes pas en mesure de confirmer que " + userName + " est en securite.",
+    "Nous vous demandons de contacter immediatement le neuf-un-un si vous etes aux Etats-Unis ou au Canada,",
+    "ou le un-un-deux si vous etes dans l'Union europeenne,",
+    "afin de demander une verification de bien-etre,",
+    "puis de consulter vos messages prives pour obtenir sa derniere localisation connue.",
     "Pour confirmer que vous avez bien recu cette alerte, appuyez sur 1.",
   ].join(" ");
 }
 
-function buildSpeechEn(name: string, hasLocation: boolean): string {
-  const loc = hasLocation
-    ? "Their last location was sent to you by text."
-    : "Their location is unknown.";
+function buildSpeechEn(contactName: string, userName: string): string {
   return [
-    "Hello.",
-    "This is an automated Safety Check alert.",
-    name + " has not responded to their safety check-ins.",
-    loc + " Please contact them immediately.",
-    "If you cannot reach them, please call 9-1-1.",
+    "Hello " + contactName + ".",
+    "This is Safety Check.",
+    "We are reaching out on behalf of " + userName + ".",
+    "We are unable to confirm whether " + userName + " is safe at this time.",
+    "Please call 9-1-1 if you are in the United States or Canada,",
+    "or 1-1-2 if you are in the European Union,",
+    "for a wellness check,",
+    "and review your private message for his last known location.",
     "To confirm that you received this alert, press 1.",
   ].join(" ");
 }
@@ -90,35 +90,41 @@ async function handleVoice(req: Request, res: Response) {
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
 
+  // Nettoie un nom pour Polly (retire accents et caractères hors alphabet).
+  const sanitizeName = (raw: string): string =>
+    raw
+      .replace(/[éèêë]/g, "e")
+      .replace(/[àâä]/g, "a")
+      .replace(/[ùûü]/g, "u")
+      .replace(/[îï]/g, "i")
+      .replace(/[ôö]/g, "o")
+      .replace(/[ç]/g, "c")
+      .replace(/[^a-zA-Z0-9 _-]/g, "")
+      .trim();
+
   try {
-    let userName = lang === "fr" ? "votre contact" : "your contact";
-    let hasLocation = false;
+    let userName = lang === "fr" ? "votre proche" : "your contact";
+    let contactName = "";
 
     if (alertId && alertId !== "TEST") {
       const alert = await db.alertEvent.findUnique({
         where: { id: alertId },
-        include: { user: true },
+        include: { user: { include: { emergencyContact: true } } },
       });
       if (alert?.user?.firstName) {
-        userName = alert.user.firstName
-          .replace(/[éèêë]/g, "e")
-          .replace(/[àâä]/g, "a")
-          .replace(/[ùûü]/g, "u")
-          .replace(/[îï]/g, "i")
-          .replace(/[ôö]/g, "o")
-          .replace(/[ç]/g, "c")
-          .replace(/[^a-zA-Z0-9 _-]/g, "");
+        userName = sanitizeName(alert.user.firstName) || userName;
       }
-      hasLocation =
-        alert?.latAtTrigger != null && alert?.lngAtTrigger != null;
+      if (alert?.user?.emergencyContact?.name) {
+        contactName = sanitizeName(alert.user.emergencyContact.name);
+      }
     }
 
     const voice = twimlVoice(lang);
     const langAttr = twimlLang(lang);
     const speech =
       lang === "fr"
-        ? buildSpeechFr(userName, hasLocation)
-        : buildSpeechEn(userName, hasLocation);
+        ? buildSpeechFr(contactName, userName)
+        : buildSpeechEn(contactName, userName);
 
     const gatherUrl = alertId
       ? `${BASE_URL}/twiml/gather?alertId=${encodeURIComponent(alertId)}&amp;lang=${lang}`
