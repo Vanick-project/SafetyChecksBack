@@ -49,7 +49,7 @@ const updateScheduleSchema = z.object({
 
 async function upsertPrimaryContact(
   userId: string,
-  data: { name: string; phoneNumber: string; relationship?: string | null },
+  data: { name: string; phoneNumber: string; relationship?: string | null | undefined },
 ) {
   return db.emergencyContact.upsert({
     where: { userId_priority: { userId, priority: 1 } },
