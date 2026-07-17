@@ -1,4 +1,11 @@
 // Safety Check — Prisma Schema
+// PHASE 1 PAYWALL :
+//   - User.plan (FREE | BASIC) + planExpiresAt + revenueCatUserId
+//   - EmergencyContact : one-to-many, priority (ordre d'appel), enabled
+//   - AlertEvent.currentContactId : contact en cours dans la cascade
+//   - AlertAction.contactId : rattache chaque SMS/appel à un contact précis
+//   - SubscriptionEvent : audit des webhooks RevenueCat
+//   - AdminUser : comptes du dashboard (ADMIN | SUPPORT)
 
 generator client {
   provider        = "prisma-client-js"
@@ -24,35 +31,35 @@ model User {
   lastLat              Float?
   lastLng              Float?
   status               UserStatus @default(ACTIVE)
-  checkInIntervalHours Int        @default(24)   // legacy — utilisé comme fallback
+  checkInIntervalHours Int        @default(24) // legacy — utilisé comme fallback
   createdAt            DateTime   @default(now())
   updatedAt            DateTime   @updatedAt
   lastCheckInAt        DateTime?
   language             String     @default("fr")
-  timezone String?
+  timezone             String?
   alertChannel         String     @default("sms")
   alertSystemEnabled   Boolean    @default(true)
   notificationsEnabled Boolean    @default(true)
-  recurring      Boolean @default(true)
-  checkInActive  Boolean @default(true)
+  recurring            Boolean    @default(true)
+  checkInActive        Boolean    @default(true)
+
+  // ── Abonnement ───────────────────────────────────────────────────────────
+  plan             Plan      @default(FREE)
+  planExpiresAt    DateTime? // fin de la période payée (mis à jour par RevenueCat)
+  revenueCatUserId String?   // original_app_user_id RevenueCat
 
   // ── Schedule avancé ──────────────────────────────────────────────────────
-  // scheduleType : "interval" | "weekly" | "monthly"
-  scheduleType            String  @default("interval")
-  // Pour interval : durée totale = scheduleIntervalHours * 60 + scheduleIntervalMinutes
-  scheduleIntervalHours   Int     @default(24)
-  scheduleIntervalMinutes Int     @default(0)
-  // Pour weekly : jour de la semaine (0=Dim, 1=Lun, ..., 6=Sam)
+  scheduleType            String @default("interval")
+  scheduleIntervalHours   Int    @default(24)
+  scheduleIntervalMinutes Int    @default(0)
   scheduleDayOfWeek       Int?
-  // Pour monthly : jour du mois (1..31)
   scheduleDayOfMonth      Int?
-  // Pour weekly et monthly : heure et minute du check-in
-  scheduleTimeHour        Int     @default(9)
-  scheduleTimeMinute      Int     @default(0)
+  scheduleTimeHour        Int    @default(9)
+  scheduleTimeMinute      Int    @default(0)
 
-  emergencyContact EmergencyContact?
-  checkInEvents    CheckInEvent[]
-  alertEvents      AlertEvent[]
+  emergencyContacts EmergencyContact[]
+  checkInEvents     CheckInEvent[]
+  alertEvents       AlertEvent[]
 }
 
 enum UserStatus {
@@ -61,18 +68,28 @@ enum UserStatus {
   DELETED
 }
 
-// ─── EMERGENCY CONTACTS ──────────────────────────────────────────────────────
+enum Plan {
+  FREE
+  BASIC
+}
+
+// ─── EMERGENCY CONTACTS (one-to-many) ────────────────────────────────────────
 
 model EmergencyContact {
   id           String   @id @default(cuid())
-  userId       String   @unique
+  userId       String
   name         String
   phoneNumber  String
   relationship String?
+  priority     Int      @default(1) // ordre d'appel de la cascade : 1, 2, 3
+  enabled      Boolean  @default(true) // inclus dans la séquence SOS ?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, priority])
+  @@index([userId])
 }
 
 // ─── CHECK-IN EVENTS ─────────────────────────────────────────────────────────
@@ -98,14 +115,15 @@ enum CheckInResponse {
 // ─── ALERT EVENTS ────────────────────────────────────────────────────────────
 
 model AlertEvent {
-  id            String      @id @default(cuid())
-  userId        String
-  triggerReason AlertReason
-  triggeredAt   DateTime    @default(now())
-  resolvedAt    DateTime?
-  status        AlertStatus @default(ACTIVE)
-  latAtTrigger  Float?
-  lngAtTrigger  Float?
+  id               String      @id @default(cuid())
+  userId           String
+  triggerReason    AlertReason
+  triggeredAt      DateTime    @default(now())
+  resolvedAt       DateTime?
+  status           AlertStatus @default(ACTIVE)
+  latAtTrigger     Float?
+  lngAtTrigger     Float?
+  currentContactId String? // contact d'urgence en cours dans la cascade
 
   user    User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   actions AlertAction[]
@@ -141,13 +159,15 @@ model AlertAction {
   amdResult     String?
   callStatus    String?
   callDuration  Int?
+  contactId     String? // contact d'urgence visé par cette action (cascade)
 
   alert AlertEvent @relation(fields: [alertId], references: [id], onDelete: Cascade)
 
   @@index([alertId])
+  @@index([contactId])
 }
 
-// ─── SUPPORT MESSAGES (formulaire Contactez-nous) ─────────────────────────────
+// ─── SUPPORT MESSAGES ────────────────────────────────────────────────────────
 
 model SupportMessage {
   id           String   @id @default(cuid())
@@ -159,4 +179,37 @@ model SupportMessage {
   createdAt    DateTime @default(now())
 
   @@index([status])
+}
+
+// ─── SUBSCRIPTION EVENTS (audit webhooks RevenueCat) ─────────────────────────
+
+model SubscriptionEvent {
+  id           String    @id @default(cuid())
+  userId       String?
+  type         String // INITIAL_PURCHASE | RENEWAL | CANCELLATION | EXPIRATION | ...
+  store        String? // PLAY_STORE | APP_STORE
+  productId    String?
+  environment  String? // SANDBOX | PRODUCTION
+  expirationAt DateTime?
+  payload      Json
+  createdAt    DateTime  @default(now())
+
+  @@index([userId])
+  @@index([type])
+}
+
+// ─── ADMIN USERS (dashboard — Phase 2) ───────────────────────────────────────
+
+model AdminUser {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  role         AdminRole @default(SUPPORT)
+  createdAt    DateTime  @default(now())
+  lastLoginAt  DateTime?
+}
+
+enum AdminRole {
+  ADMIN // accès total, y compris stats de paiement
+  SUPPORT // accès à tout SAUF les stats de paiement
 }

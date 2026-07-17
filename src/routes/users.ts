@@ -1,8 +1,14 @@
 // ─── src/routes/users.ts ─────────────────────────────────────────────────────
 //
-// AJOUT : PATCH /users/schedule — sauvegarde la config de schedule avancé.
-// AJOUT : persistance de `timezone` (IANA) dans /register, /checkin-interval
-//         et /schedule → nécessaire au calcul weekly/monthly côté serveur.
+// PHASE 1 MULTI-CONTACTS :
+//   - /register : le contact d'onboarding devient le contact PRIORITÉ 1
+//     (upsert sur la clé composée userId_priority → réinstallation safe).
+//   - PATCH /emergency-contact : LEGACY conservé pour les versions d'app déjà
+//     installées chez les testeurs — modifie toujours le contact priorité 1.
+//     Les nouvelles versions utilisent /contacts (CRUD complet).
+//   - GET /users/:id : renvoie emergencyContacts[] (ordonné par priorité)
+//     + un champ de COMPATIBILITÉ emergencyContact (= priorité 1) pour que
+//     l'app actuelle des testeurs continue de fonctionner sans mise à jour.
 
 import { Router } from "express";
 import type { Request, Response } from "express";
@@ -37,6 +43,32 @@ const updateScheduleSchema = z.object({
   recurring: z.boolean().optional(),
 });
 
+// ─── Helper : upsert du contact PRIORITÉ 1 ───────────────────────────────────
+// Utilisé par /register et le PATCH legacy. Clé composée userId_priority
+// (générée par Prisma depuis @@unique([userId, priority])).
+
+async function upsertPrimaryContact(
+  userId: string,
+  data: { name: string; phoneNumber: string; relationship?: string | null },
+) {
+  return db.emergencyContact.upsert({
+    where: { userId_priority: { userId, priority: 1 } },
+    update: {
+      name: data.name,
+      phoneNumber: data.phoneNumber,
+      relationship: data.relationship ?? null,
+    },
+    create: {
+      userId,
+      priority: 1,
+      enabled: true,
+      name: data.name,
+      phoneNumber: data.phoneNumber,
+      relationship: data.relationship ?? null,
+    },
+  });
+}
+
 // POST /users/register
 router.post("/register", async (req: Request, res: Response) => {
   try {
@@ -49,8 +81,6 @@ router.post("/register", async (req: Request, res: Response) => {
     // L'onboarding = check-in par INTERVALLE simple. On réécrit TOUT le schedule
     // pour écraser un schedule avancé laissé par une installation précédente,
     // et on remet lastCheckInAt à maintenant → le compte à rebours repart à zéro.
-    // On stocke aussi le fuseau : inutile en interval, mais prêt si l'utilisateur
-    // passe ensuite en weekly/monthly.
     const onboardingSchedule = {
       checkInIntervalHours,
       scheduleType: "interval" as const,
@@ -76,20 +106,8 @@ router.post("/register", async (req: Request, res: Response) => {
       },
     });
 
-    await db.emergencyContact.upsert({
-      where: { userId: user.id },
-      update: {
-        name: emergencyContact.name,
-        phoneNumber: emergencyContact.phoneNumber,
-        relationship: emergencyContact.relationship ?? null,
-      },
-      create: {
-        userId: user.id,
-        name: emergencyContact.name,
-        phoneNumber: emergencyContact.phoneNumber,
-        relationship: emergencyContact.relationship ?? null,
-      },
-    });
+    // Le contact d'onboarding = contact priorité 1 de la cascade
+    await upsertPrimaryContact(user.id, emergencyContact);
 
     await scheduleCheckIn(user.id);
     return res.status(201).json({ userId: user.id, checkInIntervalHours });
@@ -101,18 +119,21 @@ router.post("/register", async (req: Request, res: Response) => {
   }
 });
 
-// PATCH /users/emergency-contact
+// PATCH /users/emergency-contact — LEGACY (app actuelle des testeurs)
+// Modifie toujours le contact priorité 1. Nouvelles versions → /contacts.
 router.patch("/emergency-contact", async (req: Request, res: Response) => {
   try {
     const parsed = updateEmergencyContactSchema.parse(req.body);
     const { userId, name, phoneNumber, relationship } = parsed;
     const user = await db.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
-    const emergencyContact = await db.emergencyContact.upsert({
-      where: { userId },
-      update: { name, phoneNumber, relationship: relationship || null },
-      create: { userId, name, phoneNumber, relationship: relationship || null },
+
+    const emergencyContact = await upsertPrimaryContact(userId, {
+      name,
+      phoneNumber,
+      relationship: relationship || null,
     });
+
     return res.json({ ok: true, emergencyContact });
   } catch (err: any) {
     if (err instanceof ZodError)
@@ -199,7 +220,6 @@ router.patch("/schedule", async (req: Request, res: Response) => {
         scheduleType,
         ...(scheduleFields.scheduleIntervalHours !== undefined && {
           scheduleIntervalHours: scheduleFields.scheduleIntervalHours,
-          // Met aussi à jour checkInIntervalHours (legacy countdown)
           checkInIntervalHours: scheduleFields.scheduleIntervalHours,
         }),
         ...(scheduleFields.scheduleIntervalMinutes !== undefined && {
@@ -219,13 +239,11 @@ router.patch("/schedule", async (req: Request, res: Response) => {
         }),
         ...(timezone && { timezone }),
         ...(recurring !== undefined && { recurring }),
-        // Un nouveau réglage réactive toujours le cycle de check-in.
         checkInActive: true,
         lastCheckInAt: new Date(),
       },
     });
 
-    // Reprogramme le job BullMQ avec le nouveau schedule
     await scheduleCheckIn(userId);
 
     console.log(`📅 Schedule updated to '${scheduleType}' for user ${userId}`);
@@ -258,10 +276,17 @@ router.get("/:id", async (req: Request, res: Response) => {
     const userId = String(req.params.id);
     const user = await db.user.findUnique({
       where: { id: userId },
-      include: { emergencyContact: true },
+      include: {
+        emergencyContacts: { orderBy: { priority: "asc" } },
+      },
     });
     if (!user) return res.status(404).json({ error: "User not found" });
-    return res.json(user);
+
+    // COMPATIBILITÉ : l'app actuelle des testeurs lit data.emergencyContact
+    // (singulier). On expose le contact priorité 1 sous ce nom.
+    const primary = user.emergencyContacts[0] ?? null;
+
+    return res.json({ ...user, emergencyContact: primary });
   } catch (err) {
     console.error("GET /users/:id error:", err);
     return res.status(500).json({ error: "Fetch failed" });

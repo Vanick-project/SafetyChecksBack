@@ -1,6 +1,11 @@
 // ─── src/routes/checkins.ts ───────────────────────────────────────────────────
-// SECURITY: Input now validated via checkInResponseSchema (Zod).
-// Uses z.enum(["OK","SOS"]) — invalid values rejected at schema level.
+//
+// PHASE 1 PAYWALL :
+//   GET /history/:userId est désormais limité PAR PLAN (enforcement serveur) :
+//     FREE  → 7 jours  (PLAN_LIMITS.FREE.historyDays)
+//     BASIC → 365 jours (PLAN_LIMITS.BASIC.historyDays)
+//   La réponse passe d'un tableau brut à { plan, historyDays, events } pour
+//   que le frontend affiche le bandeau "Passez à Basic pour 12 mois".
 
 import { Router } from "express";
 import type { Request, Response } from "express";
@@ -8,6 +13,7 @@ import { ZodError } from "zod";
 import { db } from "../db/client.js";
 import { handleUserResponse } from "../jobs/checkin-scheduler.js";
 import { checkInResponseSchema } from "../validators/schemas.js";
+import { PLAN_LIMITS, resolveUserPlan } from "../services/plan.js";
 
 export const checkInRouter = Router();
 
@@ -17,10 +23,6 @@ checkInRouter.post("/respond", async (req: Request, res: Response) => {
     const parsed = checkInResponseSchema.parse(req.body);
     const { userId, checkInId, response, source } = parsed;
 
-    // Backwards-compatible source resolution:
-    // - If source is explicitly sent → use it
-    // - If checkInId is "manual" or "manual-sos" (legacy clients) → manual
-    // - Otherwise → scheduled
     const resolvedSource =
       source ??
       (checkInId === "manual" || checkInId === "manual-sos"
@@ -51,23 +53,27 @@ checkInRouter.post("/respond", async (req: Request, res: Response) => {
   }
 });
 
-// GET /checkins/history/:userId
+// GET /checkins/history/:userId — fenêtre limitée par le plan
 checkInRouter.get("/history/:userId", async (req: Request, res: Response) => {
   try {
     const userId = String(req.params.userId);
 
-    // Basic CUID format check to avoid arbitrary strings hitting the DB.
     if (!/^c[a-z0-9]{24,}$/.test(userId)) {
       return res.status(400).json({ error: "Invalid userId format" });
     }
 
+    const plan = await resolveUserPlan(userId);
+    const { historyDays, historyMaxRows } = PLAN_LIMITS[plan];
+
+    const since = new Date(Date.now() - historyDays * 24 * 60 * 60 * 1000);
+
     const events = await db.checkInEvent.findMany({
-      where: { userId },
+      where: { userId, sentAt: { gte: since } },
       orderBy: { sentAt: "desc" },
-      take: 30,
+      take: historyMaxRows,
     });
 
-    return res.json(events);
+    return res.json({ plan, historyDays, events });
   } catch (err) {
     console.error("GET /checkins/history/:userId error:", err);
     return res.status(500).json({ error: "Fetch failed" });

@@ -1,9 +1,13 @@
 // ─── src/services/twilio.ts ──────────────────────────────────────────────────
 //
-// CHANGEMENTS :
-//   1. sendLocationSMS et sendEscalationSMS : message unifié au format demandé :
-//      "Hello [Contact], This is SafetyCheck... Please call 911... [maps link]"
-//   2. callEmergencyContact : URL mise à jour vers /twiml/voice (nouveau endpoint)
+// PHASE 1 CASCADE :
+//   1. sendLocationSMS(alertId, contactId) et callEmergencyContact(alertId,
+//      contactId) ciblent désormais UN contact précis — la cascade décide lequel.
+//   2. Chaque AlertAction enregistre contactId → compteur de tentatives PAR
+//      contact + timeline par contact sur l'AlertScreen et le futur dashboard.
+//   3. sendEscalationSMS SUPPRIMÉ : la cascade remplace l'escalade (chaque
+//      contact reçoit son SMS géolocalisé au moment où il est engagé).
+//   4. La garde MAX_CALL_ATTEMPTS est désormais PAR CONTACT.
 
 import twilio from "twilio";
 import { db } from "../db/client.js";
@@ -25,7 +29,6 @@ function buildSMSBody(
   mapsLink: string | null,
   language: string,
 ): string {
-  // Format demandé exactement, avec localisation si disponible
   if (language === "en") {
     return (
       `Hello ${contactName},\n\n` +
@@ -38,7 +41,6 @@ function buildSMSBody(
     );
   }
 
-  // Français
   return (
     `Bonjour ${contactName},\n\n` +
     `Ceci est SafetyCheck. Nous vous contactons au nom de ${userName}. ` +
@@ -50,117 +52,51 @@ function buildSMSBody(
   );
 }
 
-// ─── SMS D'ESCALADE ───────────────────────────────────────────────────────────
-// Envoyé au contact d'urgence après MAX_CALL_ATTEMPTS appels sans réponse.
-
-export async function sendEscalationSMS(alertId: string): Promise<void> {
+/**
+ * Charge l'alerte + l'utilisateur + LE contact ciblé, avec vérification
+ * d'appartenance (le contact doit appartenir au propriétaire de l'alerte).
+ */
+async function loadAlertAndContact(alertId: string, contactId: string) {
   const alert = await db.alertEvent.findUnique({
     where: { id: alertId },
-    include: { user: { include: { emergencyContact: true } } },
+    include: { user: true },
   });
+  if (!alert) throw new Error(`Alert ${alertId} not found`);
 
-  if (!alert) throw new Error("Alert not found");
+  const contact = await db.emergencyContact.findUnique({
+    where: { id: contactId },
+  });
+  if (!contact) throw new Error(`Emergency contact ${contactId} not found`);
+  if (contact.userId !== alert.userId) {
+    throw new Error(
+      `Contact ${contactId} does not belong to user ${alert.userId} (alert ${alertId})`,
+    );
+  }
 
-  const { user } = alert;
-  const contact = user.emergencyContact;
-  if (!contact) throw new Error("Emergency contact not found");
-
-  const userName = user.firstName ?? "your contact";
-  const contactName = contact.name;
-  const channel = (user as any).alertChannel ?? "sms";
-  const language = (user as any).language ?? "fr";
-
-  // Coordonnées : celles figées à l'alerte, sinon fallback sur la dernière
-  // position connue de l'utilisateur (évite un SMS sans géoloc quand l'alerte
-  // a été créée avant que PATCH /users/location n'écrive lastLat/lastLng).
-  const lat = alert.latAtTrigger ?? user.lastLat ?? null;
-  const lng = alert.lngAtTrigger ?? user.lastLng ?? null;
-  const hasLocation = lat != null && lng != null;
-  const mapsLink = hasLocation
-    ? `https://www.google.com/maps?q=${lat},${lng}`
-    : null;
-
-  const body = buildSMSBody(contactName, userName, mapsLink, language);
-
-  const sendSMS = async () => {
-    const message = await client.messages.create({
-      body,
-      from: FROM_NUMBER,
-      to: contact!.phoneNumber,
-      statusCallback: `${BASE_URL}/twilio/sms-status`,
-    });
-
-    await db.alertAction.create({
-      data: {
-        alertId,
-        actionType: "CALL",
-        destination: "escalation",
-        outcome: "escalation_sms_sent",
-        executedAt: new Date(),
-      },
-    });
-
-    console.log(`📱 Escalation SMS sent for alert ${alertId} → ${message.sid}`);
-  };
-
-  const sendWhatsApp = async () => {
-    const from = `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER ?? FROM_NUMBER}`;
-    const to = `whatsapp:${contact!.phoneNumber}`;
-
-    const message = await client.messages.create({
-      body,
-      from,
-      to,
-      statusCallback: `${BASE_URL}/twilio/sms-status`,
-    });
-
-    await db.alertAction.create({
-      data: {
-        alertId,
-        actionType: "CALL",
-        destination: "escalation",
-        outcome: "escalation_whatsapp_sent",
-        executedAt: new Date(),
-      },
-    });
-
-    console.log(`💬 Escalation WhatsApp sent for alert ${alertId} → ${message.sid}`);
-  };
-
-  if (channel === "sms") await sendSMS();
-  else if (channel === "whatsapp") await sendWhatsApp();
-  else if (channel === "both") await Promise.all([sendSMS(), sendWhatsApp()]);
+  return { alert, user: alert.user, contact };
 }
 
 // ─── SMS DE POSITION ──────────────────────────────────────────────────────────
-// Envoyé immédiatement quand l'alerte se déclenche (SOS manuel ou auto).
-// Utilise le même format de message que sendEscalationSMS.
+// Envoyé au contact au moment où la cascade l'engage (une fois par contact).
 
-export async function sendLocationSMS(alertId: string): Promise<string> {
-  const alert = await db.alertEvent.findUnique({
-    where: { id: alertId },
-    include: { user: { include: { emergencyContact: true } } },
-  });
-
-  if (!alert) throw new Error("Alert not found");
-
-  const { user } = alert;
-  const contact = user.emergencyContact;
-  if (!contact) throw new Error("Emergency contact not found");
+export async function sendLocationSMS(
+  alertId: string,
+  contactId: string,
+): Promise<string> {
+  const { alert, user, contact } = await loadAlertAndContact(alertId, contactId);
 
   const userName = user.firstName ?? "your contact";
-  const contactName = contact.name;
-  const language = (user as any).language ?? "fr";
+  const language = user.language ?? "fr";
 
-  // Fallback : coordonnées de l'alerte, sinon dernière position connue.
+  // Coordonnées figées à l'alerte, sinon dernière position connue
   const lat = alert.latAtTrigger ?? user.lastLat ?? null;
   const lng = alert.lngAtTrigger ?? user.lastLng ?? null;
-  const hasLocation = lat != null && lng != null;
-  const mapsLink = hasLocation
-    ? `https://www.google.com/maps?q=${lat},${lng}`
-    : null;
+  const mapsLink =
+    lat != null && lng != null
+      ? `https://www.google.com/maps?q=${lat},${lng}`
+      : null;
 
-  const body = buildSMSBody(contactName, userName, mapsLink, language);
+  const body = buildSMSBody(contact.name, userName, mapsLink, language);
 
   const message = await client.messages.create({
     body,
@@ -174,46 +110,43 @@ export async function sendLocationSMS(alertId: string): Promise<string> {
       alertId,
       actionType: "SMS",
       destination: contact.phoneNumber,
+      contactId: contact.id,
       outcome: message.status,
       providerSid: message.sid,
       executedAt: new Date(),
     },
   });
 
-  console.log(`📩 Location SMS sent for alert ${alertId} → SID ${message.sid}`);
+  console.log(
+    `📩 Location SMS sent for alert ${alertId} → contact ${contact.id} → SID ${message.sid}`,
+  );
   return message.sid;
 }
 
 // ─── VOICE CALL ──────────────────────────────────────────────────────────────
 
-export async function callEmergencyContact(alertId: string) {
-  const alert = await db.alertEvent.findUnique({
-    where: { id: alertId },
-    include: { user: { include: { emergencyContact: true } } },
-  });
+export async function callEmergencyContact(
+  alertId: string,
+  contactId: string,
+): Promise<string> {
+  const { user, contact } = await loadAlertAndContact(alertId, contactId);
 
-  if (!alert) throw new Error("Alert not found");
-
-  const { user } = alert;
-  const contact = user.emergencyContact;
-  if (!contact) throw new Error("Emergency contact not found");
-
+  // Garde PAR CONTACT — filet de sécurité si un job en double se glisse
   const previousAttempts = await db.alertAction.count({
-    where: {
-      alertId,
-      actionType: "CALL",
-      destination: { notIn: ["911", "escalation"] },
-    },
+    where: { alertId, actionType: "CALL", contactId: contact.id },
   });
 
   if (previousAttempts >= MAX_CALL_ATTEMPTS) {
     throw new Error(
-      `Max emergency call attempts (${MAX_CALL_ATTEMPTS}) already reached for alert ${alertId}`,
+      `Max call attempts (${MAX_CALL_ATTEMPTS}) already reached for contact ` +
+        `${contact.id} on alert ${alertId}`,
     );
   }
 
-  const lang = (user as any).language ?? "fr";
+  const lang = user.language ?? "fr";
 
+  // /twiml/voice lit currentContactId en DB pour prononcer le bon nom —
+  // pas besoin de passer le contact dans l'URL.
   const twimlUrl =
     `${BASE_URL}/twiml/voice` +
     `?alertId=${encodeURIComponent(alertId)}` +
@@ -238,6 +171,7 @@ export async function callEmergencyContact(alertId: string) {
       alertId,
       actionType: "CALL",
       destination: contact.phoneNumber,
+      contactId: contact.id,
       outcome: call.status,
       providerSid: call.sid,
       executedAt: new Date(),
@@ -245,14 +179,10 @@ export async function callEmergencyContact(alertId: string) {
   });
 
   console.log(
-    `📞 Emergency call attempt ${previousAttempts + 1}/${MAX_CALL_ATTEMPTS} ` +
-    `created for alert ${alertId} → SID ${call.sid}`,
+    `📞 Call attempt ${previousAttempts + 1}/${MAX_CALL_ATTEMPTS} ` +
+      `→ contact ${contact.id} (priority ${contact.priority}) ` +
+      `for alert ${alertId} → SID ${call.sid}`,
   );
 
   return call.sid;
-}
-
-// buildAlertTwiML conservé pour compatibilité — ne plus utiliser en production
-export function buildAlertTwiML(name: string, _mapsLink: string): string {
-  return `<?xml version="1.0" encoding="UTF-8"?><Response><Say>${name}</Say></Response>`;
 }

@@ -1,16 +1,12 @@
 // ─── src/jobs/checkin-scheduler.ts ───────────────────────────────────────────
-// CHANGEMENTS vs version précédente :
-//   - scheduleCheckIn gère les 3 modes (interval | weekly | monthly), en
-//     miroir de getNextCheckInMs du HomeScreen → affichage et déclenchement
-//     restent cohérents.
-//   - weekly/monthly sont calculés dans le FUSEAU de l'utilisateur (champ
-//     User.timezone, IANA, ex "America/Toronto") via luxon → gère aussi le DST.
-//     Fallback "UTC" si le fuseau n'est pas connu.
-//   - interval reste une pure durée depuis lastCheckInAt (indépendant du fuseau).
-//   - Cadence de rappels ADAPTATIVE : 2 min si intervalle < 30 min, 5 min sinon.
-//   - Récurrence (User.recurring) : si false, arrêt du cycle après une réponse OK
-//     (checkInActive=false). L'auto-SOS en cas de non-réponse reste toujours actif.
-//   - Plancher d'intervalle : 15 min. MAX_REMINDERS = 3.
+// PHASE 1 CASCADE (seuls changements vs version précédente) :
+//   - triggerAutomaticSOS et handleUserResponse(SOS) vérifient désormais
+//     qu'AU MOINS UN contact ACTIVÉ existe (emergencyContacts, plus le
+//     singulier emergencyContact qui n'existe plus dans le schéma).
+//   - Le job "sendEmergencyAlert" ne transporte plus emergencyContactId /
+//     emergencyPhone : la cascade résout les contacts depuis la DB.
+// Tout le reste (scheduling interval/weekly/monthly, rappels adaptatifs,
+// récurrence) est INCHANGÉ.
 
 import { Queue, Worker, Job } from "bullmq";
 import { Redis } from "ioredis";
@@ -78,9 +74,6 @@ export const checkInQueue: Queue | null = connection
   : null;
 
 // ─── CALCUL DU PROCHAIN CHECK-IN ──────────────────────────────────────────────
-// Retourne le nombre de millisecondes jusqu'au prochain check-in.
-// Reproduit exactement getNextCheckInMs du HomeScreen, mais côté serveur et
-// dans le fuseau de l'utilisateur pour weekly/monthly.
 
 async function computeNextDelayMs(userId: string): Promise<number> {
   const user = await db.user.findUnique({
@@ -123,9 +116,7 @@ async function computeNextDelayMs(userId: string): Promise<number> {
   const timeM = user.scheduleTimeMinute ?? 0;
 
   if (type === "weekly") {
-    // scheduleDayOfWeek : 0=dimanche..6=samedi (convention JS, comme le HomeScreen)
     const targetDowJs = user.scheduleDayOfWeek ?? 1;
-    // luxon weekday : 1=lundi..7=dimanche → %7 donne dim=0..sam=6 (= getDay JS)
     const nowDowJs = nowLocal.weekday % 7;
     const daysUntil = ((targetDowJs - nowDowJs + 7) % 7) || 7;
     const next = nowLocal
@@ -142,7 +133,6 @@ async function computeNextDelayMs(userId: string): Promise<number> {
       second: 0,
       millisecond: 0,
     });
-    // clamp au dernier jour du mois (ex : 31 en février → 28/29)
     next = next.set({ day: Math.min(rawDom, next.daysInMonth ?? 28) });
     if (next <= nowLocal) {
       const nm = next.plus({ months: 1 });
@@ -162,7 +152,6 @@ export async function scheduleCheckIn(userId: string) {
     return;
   }
 
-  // Annule tous les jobs existants pour cet utilisateur.
   const jobsToCancel = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
     checkInQueue.getJob(`checkin-reminder-${userId}`), // legacy
@@ -172,7 +161,6 @@ export async function scheduleCheckIn(userId: string) {
   ]);
   await Promise.all(jobsToCancel.map((j) => j?.remove()));
 
-  // Délai jusqu'au prochain check-in selon le mode (interval/weekly/monthly).
   const delayMs = await computeNextDelayMs(userId);
 
   await checkInQueue.add(
@@ -213,9 +201,15 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
     return;
   }
 
+  // CASCADE : au moins un contact ACTIVÉ requis
   const user = await db.user.findUnique({
     where: { id: userId },
-    include: { emergencyContact: true },
+    include: {
+      emergencyContacts: {
+        where: { enabled: true },
+        orderBy: { priority: "asc" },
+      },
+    },
   });
 
   if (!user) {
@@ -223,8 +217,8 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
     return;
   }
 
-  if (!user.emergencyContact) {
-    console.warn(`⚠️ User ${userId} has no emergency contact — cannot SOS`);
+  if (user.emergencyContacts.length === 0) {
+    console.warn(`⚠️ User ${userId} has no enabled emergency contact — cannot SOS`);
     return;
   }
 
@@ -264,17 +258,10 @@ async function triggerAutomaticSOS(userId: string, checkInId: string) {
 
   console.log(`🚨 Automatic SOS created for user ${userId}: ${alert.id}`);
 
+  // CASCADE : le job ne transporte que alertId + userId
   await alertQueue.add(
     "sendEmergencyAlert",
-    {
-      alertId: alert.id,
-      userId,
-      emergencyContactId: user.emergencyContact.id,
-      emergencyPhone: user.emergencyContact.phoneNumber,
-      latitude: user.lastLat ?? null,
-      longitude: user.lastLng ?? null,
-      maxCallRetries: 2,
-    },
+    { alertId: alert.id, userId },
     { attempts: 1, removeOnComplete: 50, removeOnFail: 100 },
   );
 
@@ -345,7 +332,6 @@ if (connection) {
           `🔔 Check-in sent to ${userId}, attempt ${attempt}/${MAX_REMINDERS}`,
         );
 
-        // Cadence adaptative : 2 min si intervalle court, 5 min sinon.
         const delay = await reminderDelayMs(userId);
         const delayMin = Math.round(delay / 60000);
 
@@ -433,7 +419,6 @@ export async function handleUserResponse(
     });
 
     if (u?.recurring === false) {
-      // Non-récurrent : on s'arrête après ce OK (checkInActive=false → Home affiche "aucun check-in").
       await db.user.update({
         where: { id: userId },
         data: { lastCheckInAt: new Date(), status: "ACTIVE", checkInActive: false },
@@ -451,13 +436,19 @@ export async function handleUserResponse(
   }
 
   if (response === "SOS") {
+    // CASCADE : au moins un contact ACTIVÉ requis
     const user = await db.user.findUnique({
       where: { id: userId },
-      include: { emergencyContact: true },
+      include: {
+        emergencyContacts: {
+          where: { enabled: true },
+          orderBy: { priority: "asc" },
+        },
+      },
     });
 
-    if (!user || !user.emergencyContact) {
-      console.warn(`⚠️ Cannot SOS for ${userId} — missing user or contact`);
+    if (!user || user.emergencyContacts.length === 0) {
+      console.warn(`⚠️ Cannot SOS for ${userId} — missing user or enabled contact`);
       return;
     }
 
@@ -472,17 +463,10 @@ export async function handleUserResponse(
       },
     });
 
+    // CASCADE : le job ne transporte que alertId + userId
     await alertQueue.add(
       "sendEmergencyAlert",
-      {
-        alertId: alert.id,
-        userId,
-        emergencyContactId: user.emergencyContact.id,
-        emergencyPhone: user.emergencyContact.phoneNumber,
-        latitude: user.lastLat ?? null,
-        longitude: user.lastLng ?? null,
-        maxCallRetries: 2,
-      },
+      { alertId: alert.id, userId },
       { attempts: 1, removeOnComplete: 50, removeOnFail: 100 },
     );
 

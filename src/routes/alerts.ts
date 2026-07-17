@@ -1,3 +1,11 @@
+// ─── src/routes/alerts.ts ────────────────────────────────────────────────────
+//
+// PHASE 1 CASCADE :
+//   - /trigger : vérifie qu'AU MOINS UN contact ACTIVÉ existe (multi-contacts).
+//     Le job "sendEmergencyAlert" ne transporte plus emergencyContactId /
+//     emergencyPhone — la cascade résout les contacts depuis la DB.
+//   - /resolve : inchangé (le webhook + la cascade vérifient le statut en DB).
+
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { ZodError } from "zod";
@@ -13,29 +21,18 @@ export const alertRouter = Router();
 
 function getUserIdFromHeader(req: Request): string | undefined {
   const userIdHeader = req.headers["x-user-id"];
-
-  if (typeof userIdHeader === "string") {
-    return userIdHeader;
-  }
-
-  if (Array.isArray(userIdHeader)) {
-    return userIdHeader[0];
-  }
-
+  if (typeof userIdHeader === "string") return userIdHeader;
+  if (Array.isArray(userIdHeader)) return userIdHeader[0];
   return undefined;
 }
 
 function toOptionalNumber(value: unknown): number | undefined {
-  if (value === null || value === undefined || value === "") {
-    return undefined;
-  }
-
+  if (value === null || value === undefined || value === "") return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 // POST /alerts/resolve
-
 alertRouter.post("/resolve", async (req: Request, res: Response) => {
   try {
     const parsed = resolveAlertSchema.parse(req.body);
@@ -49,7 +46,7 @@ alertRouter.post("/resolve", async (req: Request, res: Response) => {
       return res.status(404).json({ error: "Alert not found" });
     }
 
-    // 1. Résout l'alerte en DB EN PREMIER — le webhook vérifiera ce statut
+    // 1. Résout l'alerte en DB EN PREMIER — cascade et webhooks vérifient ce statut
     await db.alertEvent.update({
       where: { id: alertId },
       data: {
@@ -67,7 +64,6 @@ alertRouter.post("/resolve", async (req: Request, res: Response) => {
     });
 
     // 2. Annule tous les jobs BullMQ liés à cette alerte
-    // (sendEmergencyAlert en attente + retryEmergencyCall planifiés)
     try {
       const jobs = await alertQueue.getJobs(["delayed", "waiting", "active"]);
 
@@ -83,7 +79,7 @@ alertRouter.post("/resolve", async (req: Request, res: Response) => {
         `🛑 Cancelled ${alertJobs.length} BullMQ job(s) for alert ${alertId}`,
       );
     } catch (cancelErr) {
-      // Non-bloquant — la vérification dans le webhook prend le relais
+      // Non-bloquant — la vérification de statut dans la cascade prend le relais
       console.warn(
         `⚠️ Could not cancel BullMQ jobs for alert ${alertId}:`,
         cancelErr,
@@ -129,29 +125,31 @@ alertRouter.post("/trigger", async (req: Request, res: Response) => {
     const latitude = toOptionalNumber(parsed.latitude);
     const longitude = toOptionalNumber(parsed.longitude);
 
+    // CASCADE : il faut AU MOINS UN contact ACTIVÉ
     const user = await db.user.findUnique({
       where: { id: userId },
-      include: { emergencyContact: true },
+      include: {
+        emergencyContacts: {
+          where: { enabled: true },
+          orderBy: { priority: "asc" },
+        },
+      },
     });
 
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    if (!user.emergencyContact) {
-      return res.status(400).json({ error: "No emergency contact found" });
+    if (user.emergencyContacts.length === 0) {
+      return res.status(400).json({ error: "No enabled emergency contact found" });
     }
 
     const existingActiveAlert = await db.alertEvent.findFirst({
       where: {
         userId,
-        status: {
-          in: ["ACTIVE", "FAILED"],
-        },
+        status: { in: ["ACTIVE", "FAILED"] },
       },
-      orderBy: {
-        triggeredAt: "desc",
-      },
+      orderBy: { triggeredAt: "desc" },
     });
 
     if (existingActiveAlert) {
@@ -216,17 +214,11 @@ alertRouter.post("/trigger", async (req: Request, res: Response) => {
         },
       });
 
+      // CASCADE : le job ne transporte que alertId + userId —
+      // startCascade résout les contacts depuis la DB (état toujours frais)
       await alertQueue.add(
         "sendEmergencyAlert",
-        {
-          alertId: alert.id,
-          userId,
-          emergencyContactId: user.emergencyContact.id,
-          emergencyPhone: user.emergencyContact.phoneNumber,
-          latitude: finalLatitude ?? null,
-          longitude: finalLongitude ?? null,
-          maxCallRetries: 2,
-        },
+        { alertId: alert.id, userId },
         {
           attempts: 1,
           removeOnComplete: 50,
@@ -238,9 +230,7 @@ alertRouter.post("/trigger", async (req: Request, res: Response) => {
 
       await db.alertEvent.update({
         where: { id: alert.id },
-        data: {
-          status: "FAILED",
-        },
+        data: { status: "FAILED" },
       });
 
       await db.alertAction.create({
@@ -299,20 +289,14 @@ alertRouter.get("/active/:userId", async (req: Request, res: Response) => {
     const alert = await db.alertEvent.findFirst({
       where: {
         userId,
-        status: {
-          in: ["ACTIVE", "FAILED"],
-        },
+        status: { in: ["ACTIVE", "FAILED"] },
       },
       include: {
         actions: {
-          orderBy: {
-            executedAt: "desc",
-          },
+          orderBy: { executedAt: "desc" },
         },
       },
-      orderBy: {
-        triggeredAt: "desc",
-      },
+      orderBy: { triggeredAt: "desc" },
     });
 
     return res.json(alert ?? null);
@@ -331,14 +315,10 @@ alertRouter.get("/history/:userId", async (req: Request, res: Response) => {
       where: { userId },
       include: {
         actions: {
-          orderBy: {
-            executedAt: "desc",
-          },
+          orderBy: { executedAt: "desc" },
         },
       },
-      orderBy: {
-        triggeredAt: "desc",
-      },
+      orderBy: { triggeredAt: "desc" },
       take: 20,
     });
 

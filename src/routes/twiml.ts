@@ -1,3 +1,13 @@
+// ─── src/routes/twiml.ts ─────────────────────────────────────────────────────
+//
+// PHASE 1 CASCADE :
+//   - /voice : le nom du contact est lu depuis AlertEvent.currentContactId
+//     (plus depuis user.emergencyContact qui n'existe plus).
+//   - /call-status : logique inchangée — succès si appui sur 1 (answered_human
+//     écrit par /gather) ou AMD=human ; sinon planifie "retryEmergencyCall".
+//     C'est le worker (continueCascade) qui décide : retry même contact,
+//     contact suivant, ou FAILED.
+
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { Queue } from "bullmq";
@@ -11,13 +21,11 @@ console.log("✅ twimlRouter loaded");
 const BASE_URL = process.env.API_BASE_URL!;
 
 // ─── FILE BULLMQ (producteur) ─────────────────────────────────────────────────
-// Même nom + même connexion que le Worker de alertWorker.ts → même file.
 const alertQueue = new Queue("alertQueue", { connection: redisConnection });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // ─── HELPER PARAM ─────────────────────────────────────────────────────────────
-// Twilio peut envoyer le même param dans query ET body → Express combine en tableau.
 
 function param(value: unknown): string {
   if (!value) return "";
@@ -26,7 +34,6 @@ function param(value: unknown): string {
 }
 
 // ─── OUTCOME SÉMANTIQUE ───────────────────────────────────────────────────────
-// Traduit (CallStatus, amdResult) en un outcome lisible par le frontend.
 
 function callOutcome(status: string, amd: string | null): string {
   if (status === "completed") {
@@ -90,7 +97,6 @@ async function handleVoice(req: Request, res: Response) {
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
 
-  // Nettoie un nom pour Polly (retire accents et caractères hors alphabet).
   const sanitizeName = (raw: string): string =>
     raw
       .replace(/[éèêë]/g, "e")
@@ -109,13 +115,21 @@ async function handleVoice(req: Request, res: Response) {
     if (alertId && alertId !== "TEST") {
       const alert = await db.alertEvent.findUnique({
         where: { id: alertId },
-        include: { user: { include: { emergencyContact: true } } },
+        include: { user: true },
       });
+
       if (alert?.user?.firstName) {
         userName = sanitizeName(alert.user.firstName) || userName;
       }
-      if (alert?.user?.emergencyContact?.name) {
-        contactName = sanitizeName(alert.user.emergencyContact.name);
+
+      // CASCADE : nom du contact EN COURS (currentContactId), pas d'un
+      // contact unique global
+      if (alert?.currentContactId) {
+        const contact = await db.emergencyContact.findUnique({
+          where: { id: alert.currentContactId },
+          select: { name: true },
+        });
+        if (contact?.name) contactName = sanitizeName(contact.name);
       }
     }
 
@@ -135,9 +149,6 @@ async function handleVoice(req: Request, res: Response) {
         ? "Merci. Verifiez leur situation."
         : "Thank you. Please check on them.";
 
-    // Le Gather ne POST vers /gather QUE si le contact appuie sur une touche.
-    // En cas de non-réponse (timeout), on passe au Say + Hangup, et
-    // /call-status planifiera la tentative suivante.
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="1"/>
@@ -163,8 +174,7 @@ twimlRouter.get("/voice", handleVoice);
 twimlRouter.post("/voice", handleVoice);
 
 // ─── GATHER (CONFIRMATION HUMAINE) ────────────────────────────────────────────
-// Atteint UNIQUEMENT si le contact appuie sur une touche pendant l'appel.
-// Digits === "1" = preuve fiable qu'un humain a reçu l'alerte (sans dépendre d'AMD).
+// Digits === "1" = preuve fiable qu'un humain a reçu l'alerte (indépendant d'AMD).
 
 twimlRouter.post("/gather", async (req: Request, res: Response) => {
   const alertId = param(req.query.alertId ?? req.body?.alertId) || undefined;
@@ -177,8 +187,6 @@ twimlRouter.post("/gather", async (req: Request, res: Response) => {
   const langAttr = twimlLang(lang);
 
   if (Digits === "1") {
-    // Marque CET appel comme répondu par un humain. /call-status le lira et
-    // n'ordonnera aucun retry, aucune escalade.
     try {
       if (CallSid) {
         await db.alertAction.updateMany({
@@ -204,7 +212,6 @@ twimlRouter.post("/gather", async (req: Request, res: Response) => {
 </Response>`);
   }
 
-  // Touche autre que 1 → pas de confirmation. On raccroche ; retry via call-status.
   const msg = lang === "fr" ? "Au revoir." : "Goodbye.";
   return res.type("text/xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -214,8 +221,6 @@ twimlRouter.post("/gather", async (req: Request, res: Response) => {
 });
 
 // ─── AMD CALLBACK ─────────────────────────────────────────────────────────────
-// Enregistre le verdict AMD (filet de secours pour détecter un humain).
-// PAS de raccrochage ici : AMD prend parfois un humain pour un répondeur.
 
 twimlRouter.post("/amd-callback", async (req: Request, res: Response) => {
   const CallSid = param(req.body.CallSid);
@@ -236,8 +241,9 @@ twimlRouter.post("/amd-callback", async (req: Request, res: Response) => {
 });
 
 // ─── CALL STATUS ──────────────────────────────────────────────────────────────
-// Décide succès vs retry. Succès = appui sur 1 (answered_human écrit par /gather)
-// OU AMD=human. Sinon → tentative suivante via retryEmergencyCall.
+// Décide succès vs retry. Succès = appui sur 1 OU AMD=human.
+// Échec → job "retryEmergencyCall" ; continueCascade (worker) choisit :
+// retry même contact / contact suivant / FAILED.
 
 twimlRouter.post("/call-status", async (req: Request, res: Response) => {
   const CallSid = param(req.body.CallSid);
@@ -257,8 +263,6 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
 
     const dur = CallDuration ? parseInt(CallDuration, 10) : null;
 
-    // On ne réagit qu'aux états terminaux ; les états intermédiaires ne font
-    // que mettre à jour le statut brut.
     const terminal = ["completed", "busy", "no-answer", "failed", "canceled"];
     if (!terminal.includes(CallStatus)) {
       await db.alertAction.update({
@@ -271,12 +275,12 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
     const alertId = action.alertId;
     if (!alertId) return;
 
-    // 1) Confirmation par appui sur 1 (déterministe, écrite par /gather).
+    // 1) Confirmation par appui sur 1 (écrite par /gather)
     let confirmed = action.outcome === "answered_human";
     let amd = action.amdResult;
 
-    // 2) Sinon, sur "completed" sans verdict AMD encore arrivé, court délai :
-    //    l'appui sur 1 OU l'AMD peuvent atterrir juste après le "completed".
+    // 2) Sur "completed" sans verdict AMD, court délai : l'appui sur 1 OU
+    //    l'AMD peuvent atterrir juste après le "completed".
     if (!confirmed && CallStatus === "completed" && amd == null) {
       await sleep(2500);
       const fresh = await db.alertAction.findUnique({
@@ -289,7 +293,7 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
     const humanReached =
       confirmed || (CallStatus === "completed" && amd === "human");
 
-    // Ne pas relancer si l'alerte n'est plus active (résolue / déjà FAILED).
+    // Alerte plus active → aucune suite
     const alert = await db.alertEvent.findUnique({ where: { id: alertId } });
     if (!alert || alert.status !== "ACTIVE") {
       console.log(
@@ -300,16 +304,17 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
         data: {
           callStatus: CallStatus || null,
           callDuration: dur,
-          outcome: humanReached ? "answered_human" : callOutcome(CallStatus, amd),
+          outcome: humanReached
+            ? "answered_human"
+            : callOutcome(CallStatus, amd),
         },
       });
       return;
     }
 
-    
-    // SUCCÈS : un humain a été joint → aucun retry, aucune escalade.
+    // SUCCÈS : humain joint → la cascade S'ARRÊTE (aucun retry, aucun contact suivant)
     if (humanReached) {
-      console.log(`✅ Humain joint pour ${alertId} — aucun retry.`);
+      console.log(`✅ Humain joint pour ${alertId} — cascade stoppée.`);
       await db.alertAction.update({
         where: { id: action.id },
         data: {
@@ -319,8 +324,7 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
         },
       });
 
-      // Marque l'action "System action" (PUSH/system) comme terminée avec succès.
-      // L'alerte reste ACTIVE : seul le "I'm safe" de l'utilisateur la résout (option B).
+      // L'alerte reste ACTIVE : seul le "Je suis safe" de l'utilisateur la résout.
       await db.alertAction.updateMany({
         where: {
           alertId,
@@ -333,7 +337,7 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
       return;
     }
 
-    // ÉCHEC de cette tentative → outcome sémantique + planifie la suivante.
+    // ÉCHEC de cette tentative → outcome sémantique + planifie la suite
     await db.alertAction.update({
       where: { id: action.id },
       data: {
@@ -348,13 +352,13 @@ twimlRouter.post("/call-status", async (req: Request, res: Response) => {
       { alertId },
       {
         delay: RETRY_DELAY_MS,
-        jobId: `retry-${CallSid}`,
+        jobId: `retry-${CallSid}`, // unique par appel — jamais dédupliqué à tort
         removeOnComplete: true,
         removeOnFail: true,
       },
     );
     console.log(
-      `🔁 Retry planifié pour ${alertId} dans ${RETRY_DELAY_MS / 1000}s ` +
+      `🔁 Cascade continue pour ${alertId} dans ${RETRY_DELAY_MS / 1000}s ` +
         `— cause: ${CallStatus}/${amd ?? "no-amd"}`,
     );
   } catch (e) {

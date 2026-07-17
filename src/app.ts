@@ -1,4 +1,12 @@
 // ─── src/app.ts ───────────────────────────────────────────────────────────────
+//
+// CHANGEMENTS (paywall Basic — Phase 1) :
+//   1. Import + montage de contactsRouter        → /contacts   (CRUD multi-contacts)
+//   2. Import + montage de revenueCatRouter      → /webhooks/revenuecat
+//   3. apiLimiter : skip "/webhooks" (RevenueCat retry sur 429 = pollution)
+//   4. contactsLimiter dédié (le CRUD contacts est appelé souvent par l'app)
+//
+// Le reste du fichier est INCHANGÉ par rapport à ta version actuelle.
 
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
@@ -13,6 +21,8 @@ import { twimlRouter } from "./routes/twiml.js";
 import twilioWebhookRouter from "./routes/twilio-webhook.js";
 import debugRouter from "./routes/debug.js";
 import supportRouter from "./routes/support.js";
+import contactsRouter from "./routes/contacts.js";           // ← NOUVEAU
+import revenueCatRouter from "./routes/revenuecat.js";       // ← NOUVEAU
 import "./jobs/alertWorker.js";
 import "./jobs/checkin-scheduler.js";
 
@@ -36,7 +46,9 @@ const apiLimiter = rateLimit({
   skip: (req) =>
     req.path.startsWith("/twilio") ||
     req.path.startsWith("/twiml") ||
-    req.path.startsWith("/alerts/active"), // ← poll d'alerte : limiteur dédié plus bas
+    req.path.startsWith("/webhooks") ||     // ← NOUVEAU : RevenueCat ne doit jamais être 429
+    req.path.startsWith("/contacts") ||     // ← NOUVEAU : limiteur dédié plus bas
+    req.path.startsWith("/alerts/active"),  // ← poll d'alerte : limiteur dédié plus bas
 });
 app.use(apiLimiter);
 
@@ -49,14 +61,23 @@ const sosLimiter = rateLimit({
 });
 
 // Limiteur dédié au polling de l'alerte active.
-// AlertScreen poll pendant toute la durée de l'alerte → budget large.
-// 300 req / 5 min / IP = 60/min, couvre plusieurs clients à 3-5s sans bloquer.
 const alertPollLimiter = rateLimit({
   windowMs: 5 * 60 * 1000,
   max: 300,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many alert status checks." },
+});
+
+// NOUVEAU — CRUD contacts : l'écran multi-contacts recharge la liste après
+// chaque add/patch/delete/reorder. 120 req / 15 min / IP = confortable
+// sans laisser un client boucler à l'infini.
+const contactsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many contact requests. Try again later." },
 });
 
 // Limite anti-spam pour le formulaire de contact — 5 messages / heure / IP
@@ -77,19 +98,20 @@ app.use("/checkins", checkInRouter);
 app.use("/alerts/trigger", sosLimiter);
 app.use("/alerts/active", alertPollLimiter);
 app.use("/alerts", alertRouter);
+app.use("/contacts", contactsLimiter);                    // ← NOUVEAU
+app.use("/contacts", contactsRouter);                     // ← NOUVEAU
+app.use("/webhooks/revenuecat", revenueCatRouter);        // ← NOUVEAU
 app.use("/twiml", twimlRouter);
 app.use("/twilio", twilioWebhookRouter);
 app.use("/support/contact", supportLimiter);
 app.use("/support", supportRouter);
 
 // Route debug — seulement en dev (jamais en prod)
-/*
-if (process.env.NODE_ENV !== "production") {
+// ⚠️ À REMETTRE sous condition NODE_ENV avant la publication Play Store
+if (process.env.NODE_ENV !== "production" || process.env.ENABLE_DEBUG === "true") {
   app.use("/debug", debugRouter);
-  console.log("🛠️ Debug routes enabled (dev mode)");
-}*/
-// ✅ Temporaire — pour déboguer le FCM
-app.use("/debug", debugRouter);
+  console.log("🛠️ Debug routes enabled");
+}
 
 app.use((_req, res) => {
   res.status(404).json({ error: "Route not found" });
