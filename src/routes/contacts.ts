@@ -99,7 +99,7 @@ router.post("/", async (req: Request, res: Response) => {
       db.emergencyContact.findMany({
         where: { userId },
         orderBy: { priority: "asc" },
-        select: { priority: true },
+        select: { priority: true, phoneNumber: true },
       }),
     ]);
 
@@ -112,6 +112,12 @@ router.post("/", async (req: Request, res: Response) => {
         code: "PLAN_LIMIT_CONTACTS",
         plan,
         maxContacts,
+      });
+    }
+    if (existing.some((c) => c.phoneNumber === phoneNumber)) {
+      return res.status(409).json({
+        error: "This phone number is already an emergency contact",
+        code: "DUPLICATE_PHONE",
       });
     }
 
@@ -231,6 +237,18 @@ router.patch("/:id", async (req: Request, res: Response) => {
         return res.status(400).json({
           error: "At least one emergency contact must remain enabled",
           code: "AT_LEAST_ONE_ENABLED",
+        });
+      }
+    }
+    if (phoneNumber !== undefined && phoneNumber !== contact.phoneNumber) {
+      const duplicate = await db.emergencyContact.findFirst({
+        where: { userId, phoneNumber, id: { not: contactId } },
+        select: { id: true },
+      });
+      if (duplicate) {
+        return res.status(409).json({
+          error: "This phone number is already an emergency contact",
+          code: "DUPLICATE_PHONE",
         });
       }
     }
