@@ -21,6 +21,7 @@ datasource db {
 model User {
   id                   String     @id @default(cuid())
   phoneNumber          String     @unique
+  email                String?    @unique
   firstName            String?
   address              String     @default("")
   city                 String     @default("")

@@ -8,17 +8,22 @@ import { db } from "../db/client.js";
 export const PLAN_LIMITS = {
   FREE: {
     maxContacts: 1,
-    historyDays: 7,
-    historyMaxRows: 50,
+    historyDays: 0, // STRICT : aucun historique en FREE (fonctionnalité Basic)
+    historyMaxRows: 0,
+    canCustomizeSchedule: false, // FREE : check-in réglable à l'inscription SEULEMENT
   },
   BASIC: {
     maxContacts: 3,
     historyDays: 365, // 12 mois
     historyMaxRows: 500,
+    canCustomizeSchedule: true, // BASIC : modifiable à tout moment
   },
 } as const;
 
 export type PlanName = keyof typeof PLAN_LIMITS;
+
+/** Intervalle de check-in par défaut (heures) si l'app n'en fournit aucun. */
+export const DEFAULT_CHECKIN_HOURS = 24;
 
 /**
  * Résout le plan EFFECTIF d'un utilisateur.
@@ -48,4 +53,14 @@ export async function resolveUserPlan(userId: string): Promise<PlanName> {
 export async function getUserLimits(userId: string) {
   const plan = await resolveUserPlan(userId);
   return { plan, ...PLAN_LIMITS[plan] };
+}
+
+/**
+ * true si l'utilisateur peut MODIFIER son check-in maintenant.
+ * FREE : false (le réglage n'est possible qu'à l'inscription via /register).
+ * BASIC : true.
+ */
+export async function canCustomizeSchedule(userId: string): Promise<boolean> {
+  const plan = await resolveUserPlan(userId);
+  return PLAN_LIMITS[plan].canCustomizeSchedule;
 }

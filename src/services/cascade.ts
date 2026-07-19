@@ -10,6 +10,13 @@
 //   - Tous les contacts épuisés → alerte FAILED (chaque contact a déjà reçu
 //     son SMS avec la géolocalisation — pas de SMS d'escalade supplémentaire)
 //
+// PLAFOND PAR PLAN (nouveau) :
+//   getEnabledContacts limite la cascade aux `maxContacts` premiers contacts
+//   activés (par priorité). Un compte rétrogradé BASIC→FREE garde ses 3
+//   contacts EN BASE, mais la cascade n'en sert qu'UN (priorité 1). Les
+//   contacts 2 et 3 restent dormants et réapparaissent si l'utilisateur
+//   reprend Basic — aucune suppression, downgrade réversible.
+//
 // POINTS D'ENTRÉE (appelés par alertWorker.ts) :
 //   startCascade(alertId)    ← job "sendEmergencyAlert"
 //   continueCascade(alertId) ← job "retryEmergencyCall" (planifié par
@@ -22,6 +29,7 @@
 import { db } from "../db/client.js";
 import { MAX_CALL_ATTEMPTS } from "../config/constants.js";
 import { sendLocationSMS, callEmergencyContact } from "./twilio.js";
+import { resolveUserPlan, PLAN_LIMITS } from "./plan.js";
 
 type Contact = {
   id: string;
@@ -34,12 +42,29 @@ type Contact = {
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-/** Contacts activés de l'utilisateur, dans l'ordre d'appel (priority asc). */
+/**
+ * Contacts SERVIS par la cascade, dans l'ordre d'appel (priority asc),
+ * plafonnés au nombre autorisé par le plan.
+ *
+ * FREE  → 1 contact  (priorité 1 uniquement)
+ * BASIC → 3 contacts
+ *
+ * Les contacts au-delà du plafond existent toujours en base mais ne sont
+ * jamais engagés tant que le plan ne les autorise pas. C'est ICI, et
+ * uniquement ici, que le downgrade "bloque" les contacts supplémentaires.
+ */
 export async function getEnabledContacts(userId: string): Promise<Contact[]> {
-  return db.emergencyContact.findMany({
+  const plan = await resolveUserPlan(userId);
+  const maxContacts = PLAN_LIMITS[plan].maxContacts;
+
+  const contacts = await db.emergencyContact.findMany({
     where: { userId, enabled: true },
     orderBy: { priority: "asc" },
   });
+
+  // Plafond du plan appliqué APRÈS le tri par priorité :
+  // on garde les `maxContacts` premiers contacts activés.
+  return contacts.slice(0, maxContacts);
 }
 
 /** Nombre d'appels déjà passés vers CE contact pour CETTE alerte. */
@@ -225,8 +250,8 @@ export async function continueCascade(alertId: string): Promise<void> {
     return;
   }
 
-  // Contact courant introuvable (supprimé / désactivé pendant l'alerte)
-  // → premier contact activé non épuisé
+  // Contact courant introuvable (supprimé / désactivé / passé sous le plafond
+  // du plan pendant l'alerte) → premier contact servi non épuisé
   const next = await findNextAvailableContact(alertId, contacts, 0);
   if (next) {
     console.log(

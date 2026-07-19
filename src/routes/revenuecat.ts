@@ -4,25 +4,28 @@
 // CONFIGURATION (RevenueCat → Project Settings → Integrations → Webhooks) :
 //   URL   : https://safetychecksback-production-c616.up.railway.app/webhooks/revenuecat
 //   Auth  : valeur EXACTE de la variable Railway REVENUECAT_WEBHOOK_SECRET
-//           (RevenueCat l'envoie telle quelle dans le header Authorization)
 //
 // CÔTÉ APP : Purchases.logIn(userId) OBLIGATOIRE après le register — ainsi
 // event.app_user_id = notre cuid User.id et le mapping est direct.
 //
 // MAPPING DES ÉVÉNEMENTS :
-//   INITIAL_PURCHASE / RENEWAL / UNCANCELLATION / PRODUCT_CHANGE
+//   INITIAL_PURCHASE / RENEWAL / UNCANCELLATION / PRODUCT_CHANGE / NON_RENEWING
 //     → plan = BASIC, planExpiresAt = expiration_at_ms
 //   EXPIRATION
-//     → plan = FREE (fin réelle de l'accès)
+//     → downgradeToFree() : plan FREE + check-in remis à 24h.
+//       ⚠️ Les contacts NE SONT PAS supprimés : ils restent en base et la
+//       cascade (getEnabledContacts) n'en sert qu'UN tant que le compte est
+//       FREE. Downgrade réversible — si l'utilisateur reprend Basic, ses 3
+//       contacts réapparaissent intacts.
 //   CANCELLATION / BILLING_ISSUE
-//     → AUCUN changement immédiat : l'utilisateur garde Basic jusqu'à
-//       l'expiration de la période payée (comportement standard des stores).
-//       resolveUserPlan() sert de filet si EXPIRATION n'arrive jamais.
+//     → audit seul : l'utilisateur garde Basic jusqu'à l'expiration payée.
 //   Tout événement est journalisé dans SubscriptionEvent (support + stats MRR).
 
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { db } from "../db/client.js";
+import { scheduleCheckIn } from "../jobs/checkin-scheduler.js";
+import { DEFAULT_CHECKIN_HOURS } from "../services/plan.js";
 
 const router = Router();
 
@@ -33,6 +36,40 @@ const UPGRADE_EVENTS = new Set([
   "PRODUCT_CHANGE",
   "NON_RENEWING_PURCHASE",
 ]);
+
+/**
+ * Rétrogradation BASIC → FREE.
+ *
+ * NON-DESTRUCTIF côté contacts : on ne supprime rien. Le plafond du plan est
+ * appliqué à la LECTURE par la cascade (services/plan.ts + cascade.ts), donc
+ * un FREE avec 3 contacts en base n'en voit servir qu'un. Réversible.
+ *
+ * On remet en revanche le check-in à 24h : la personnalisation (intervalle
+ * custom, weekly, monthly) est une fonctionnalité Basic. Sans ce reset, un
+ * ancien Basic garderait par ex. un check-in toutes les 2h en étant FREE.
+ *
+ * Idempotent : rejouable si RevenueCat renvoie l'événement.
+ */
+async function downgradeToFree(userId: string): Promise<void> {
+  await db.user.update({
+    where: { id: userId },
+    data: {
+      plan: "FREE",
+      planExpiresAt: null,
+      // Check-in figé à 24h (perte de la personnalisation Basic)
+      scheduleType: "interval",
+      scheduleIntervalHours: DEFAULT_CHECKIN_HOURS,
+      scheduleIntervalMinutes: 0,
+      checkInIntervalHours: DEFAULT_CHECKIN_HOURS,
+      recurring: true,
+      checkInActive: true,
+      lastCheckInAt: new Date(),
+    },
+  });
+
+  // Reprogramme le job BullMQ avec le schedule 24h
+  await scheduleCheckIn(userId);
+}
 
 router.post("/", async (req: Request, res: Response) => {
   try {
@@ -56,8 +93,6 @@ router.post("/", async (req: Request, res: Response) => {
     }
 
     const appUserId: string | undefined = event.app_user_id;
-    // Les IDs anonymes ($RCAnonymousID:...) apparaissent si l'app n'a pas
-    // encore fait Purchases.logIn(userId) — on journalise sans lier.
     const userId =
       appUserId && !appUserId.startsWith("$RCAnonymousID") ? appUserId : null;
 
@@ -107,11 +142,10 @@ router.post("/", async (req: Request, res: Response) => {
           `✅ User ${userId} → BASIC (expires ${expiresAt?.toISOString() ?? "never"})`,
         );
       } else if (event.type === "EXPIRATION") {
-        await db.user.update({
-          where: { id: userId },
-          data: { plan: "FREE", planExpiresAt: null },
-        });
-        console.log(`⬇️ User ${userId} → FREE (subscription expired)`);
+        await downgradeToFree(userId);
+        console.log(
+          `⬇️ User ${userId} → FREE (expired — contacts kept, check-in reset to 24h)`,
+        );
       }
       // CANCELLATION / BILLING_ISSUE / TRANSFER / autres → audit seul
     }

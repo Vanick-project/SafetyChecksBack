@@ -1,14 +1,15 @@
 // ─── src/routes/users.ts ─────────────────────────────────────────────────────
 //
-// PHASE 1 MULTI-CONTACTS :
-//   - /register : le contact d'onboarding devient le contact PRIORITÉ 1
-//     (upsert sur la clé composée userId_priority → réinstallation safe).
-//   - PATCH /emergency-contact : LEGACY conservé pour les versions d'app déjà
-//     installées chez les testeurs — modifie toujours le contact priorité 1.
-//     Les nouvelles versions utilisent /contacts (CRUD complet).
-//   - GET /users/:id : renvoie emergencyContacts[] (ordonné par priorité)
-//     + un champ de COMPATIBILITÉ emergencyContact (= priorité 1) pour que
-//     l'app actuelle des testeurs continue de fonctionner sans mise à jour.
+// PHASE 1 MULTI-CONTACTS + PALIERS FREE/BASIC :
+//   - /register : le contact d'onboarding devient le contact PRIORITÉ 1.
+//     NOUVEAU : /register accepte désormais le SCHEDULE COMPLET (interval /
+//     weekly / monthly). C'est la SEULE occasion pour un FREE de personnaliser
+//     son check-in — après l'inscription, toute modification exige Basic.
+//     (Le frontend n'a donc plus besoin d'enchaîner un PATCH /schedule.)
+//   - PATCH /schedule et PATCH /checkin-interval : BLOQUÉS pour les FREE
+//     (code PLAN_REQUIRED_SCHEDULE). BASIC peut modifier à tout moment.
+//   - PATCH /email : NOUVEAU — ancre d'identité posée au moment de l'achat Basic.
+//   - GET /users/:id : renvoie emergencyContacts[] + emergencyContact (legacy).
 
 import { Router } from "express";
 import type { Request, Response } from "express";
@@ -25,6 +26,7 @@ import {
   updateNotificationsSettingsSchema,
 } from "../validators/schemas.js";
 import { scheduleCheckIn } from "../jobs/checkin-scheduler.js";
+import { canCustomizeSchedule, DEFAULT_CHECKIN_HOURS } from "../services/plan.js";
 
 const router = Router();
 
@@ -43,9 +45,22 @@ const updateScheduleSchema = z.object({
   recurring: z.boolean().optional(),
 });
 
+// Schéma optionnel du schedule embarqué dans /register (choix d'onboarding).
+// Tous les champs sont optionnels : une app qui n'envoie qu'un intervalle simple
+// continue de fonctionner. Absent → check-in 24h par défaut.
+const registerScheduleSchema = z
+  .object({
+    scheduleType: z.enum(["interval", "weekly", "monthly"]).optional(),
+    scheduleIntervalHours: z.number().int().min(0).max(168).optional(),
+    scheduleIntervalMinutes: z.number().int().min(0).max(59).optional(),
+    scheduleDayOfWeek: z.number().int().min(0).max(6).optional(),
+    scheduleDayOfMonth: z.number().int().min(1).max(31).optional(),
+    scheduleTimeHour: z.number().int().min(0).max(23).optional(),
+    scheduleTimeMinute: z.number().int().min(0).max(59).optional(),
+  })
+  .optional();
+
 // ─── Helper : upsert du contact PRIORITÉ 1 ───────────────────────────────────
-// Utilisé par /register et le PATCH legacy. Clé composée userId_priority
-// (générée par Prisma depuis @@unique([userId, priority])).
 
 async function upsertPrimaryContact(
   userId: string,
@@ -69,6 +84,39 @@ async function upsertPrimaryContact(
   });
 }
 
+// ─── Helper : construit le bloc schedule depuis le choix d'onboarding ────────
+// Un FREE règle son check-in ICI, une fois. On persiste exactement son choix
+// (interval / weekly / monthly). Absent → interval 24h.
+function buildOnboardingSchedule(input: {
+  checkInIntervalHours?: number;
+  schedule?: z.infer<typeof registerScheduleSchema>;
+  timezone?: string;
+  recurring?: boolean;
+}) {
+  const s = input.schedule ?? {};
+  const type = s.scheduleType ?? "interval";
+
+  // Intervalle : priorité au schedule avancé, sinon au champ legacy, sinon 24h.
+  const intervalHours =
+    s.scheduleIntervalHours ?? input.checkInIntervalHours ?? DEFAULT_CHECKIN_HOURS;
+
+  return {
+    scheduleType: type,
+    checkInIntervalHours: intervalHours,
+    scheduleIntervalHours: intervalHours,
+    scheduleIntervalMinutes: s.scheduleIntervalMinutes ?? 0,
+    // Champs weekly/monthly : posés seulement s'ils sont fournis
+    ...(s.scheduleDayOfWeek !== undefined && { scheduleDayOfWeek: s.scheduleDayOfWeek }),
+    ...(s.scheduleDayOfMonth !== undefined && { scheduleDayOfMonth: s.scheduleDayOfMonth }),
+    ...(s.scheduleTimeHour !== undefined && { scheduleTimeHour: s.scheduleTimeHour }),
+    ...(s.scheduleTimeMinute !== undefined && { scheduleTimeMinute: s.scheduleTimeMinute }),
+    lastCheckInAt: new Date(),
+    checkInActive: true,
+    recurring: input.recurring ?? true,
+    ...(input.timezone && { timezone: input.timezone }),
+  };
+}
+
 // POST /users/register
 router.post("/register", async (req: Request, res: Response) => {
   try {
@@ -78,19 +126,17 @@ router.post("/register", async (req: Request, res: Response) => {
       emergencyContact, checkInIntervalHours, language, timezone, recurring,
     } = parsed;
 
-    // L'onboarding = check-in par INTERVALLE simple. On réécrit TOUT le schedule
-    // pour écraser un schedule avancé laissé par une installation précédente,
-    // et on remet lastCheckInAt à maintenant → le compte à rebours repart à zéro.
-    const onboardingSchedule = {
+    // Le schedule avancé éventuel est validé à part (il peut ne pas exister
+    // dans le schéma de register selon la version de l'app).
+    const schedule = registerScheduleSchema.parse((req.body as any).schedule);
+
+    // FREE règle son check-in à l'inscription. On grave son choix complet.
+    const onboardingSchedule = buildOnboardingSchedule({
       checkInIntervalHours,
-      scheduleType: "interval" as const,
-      scheduleIntervalHours: checkInIntervalHours ?? 24,
-      scheduleIntervalMinutes: 0,
-      lastCheckInAt: new Date(),
-      checkInActive: true,
-      ...(timezone && { timezone }),
-      ...(recurring !== undefined && { recurring }),
-    };
+      schedule,
+      timezone,
+      recurring,
+    });
 
     const user = await db.user.upsert({
       where: { phoneNumber },
@@ -110,7 +156,10 @@ router.post("/register", async (req: Request, res: Response) => {
     await upsertPrimaryContact(user.id, emergencyContact);
 
     await scheduleCheckIn(user.id);
-    return res.status(201).json({ userId: user.id, checkInIntervalHours });
+    return res.status(201).json({
+      userId: user.id,
+      checkInIntervalHours: onboardingSchedule.checkInIntervalHours,
+    });
   } catch (err: any) {
     if (err instanceof ZodError)
       return res.status(400).json({ error: "Invalid registration data", details: err.flatten() });
@@ -120,7 +169,6 @@ router.post("/register", async (req: Request, res: Response) => {
 });
 
 // PATCH /users/emergency-contact — LEGACY (app actuelle des testeurs)
-// Modifie toujours le contact priorité 1. Nouvelles versions → /contacts.
 router.patch("/emergency-contact", async (req: Request, res: Response) => {
   try {
     const parsed = updateEmergencyContactSchema.parse(req.body);
@@ -173,7 +221,7 @@ router.patch("/location", async (req: Request, res: Response) => {
   }
 });
 
-// PATCH /users/checkin-interval (legacy — conservé pour compatibilité)
+// PATCH /users/checkin-interval (legacy) — MODIFICATION = Basic uniquement
 router.patch("/checkin-interval", async (req: Request, res: Response) => {
   try {
     const parsed = updateCheckInIntervalSchema.parse(req.body);
@@ -182,6 +230,15 @@ router.patch("/checkin-interval", async (req: Request, res: Response) => {
     };
     const user = await db.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
+
+    // GARDE PLAN : modifier le check-in après l'inscription exige Basic.
+    if (!(await canCustomizeSchedule(userId))) {
+      return res.status(403).json({
+        error: "Schedule customization requires a Basic subscription",
+        code: "PLAN_REQUIRED_SCHEDULE",
+      });
+    }
+
     await db.user.update({
       where: { id: userId },
       data: {
@@ -205,7 +262,7 @@ router.patch("/checkin-interval", async (req: Request, res: Response) => {
   }
 });
 
-// PATCH /users/schedule — endpoint pour le schedule avancé
+// PATCH /users/schedule — schedule avancé — MODIFICATION = Basic uniquement
 router.patch("/schedule", async (req: Request, res: Response) => {
   try {
     const parsed = updateScheduleSchema.parse(req.body);
@@ -213,6 +270,14 @@ router.patch("/schedule", async (req: Request, res: Response) => {
 
     const user = await db.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
+
+    // GARDE PLAN : modifier le check-in après l'inscription exige Basic.
+    if (!(await canCustomizeSchedule(userId))) {
+      return res.status(403).json({
+        error: "Schedule customization requires a Basic subscription",
+        code: "PLAN_REQUIRED_SCHEDULE",
+      });
+    }
 
     await db.user.update({
       where: { id: userId },
@@ -253,6 +318,44 @@ router.patch("/schedule", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Invalid schedule payload", details: err.flatten() });
     console.error("PATCH /users/schedule error:", err);
     return res.status(500).json({ error: "Schedule update failed" });
+  }
+});
+
+// PATCH /users/email — ancre d'identité posée au moment de l'achat Basic.
+// Stocké en minuscules, unique par utilisateur (index partiel côté DB).
+const setEmailSchema = z.object({
+  userId: z.string().trim().min(10).max(100),
+  email: z.string().trim().email().max(200),
+});
+
+router.patch("/email", async (req: Request, res: Response) => {
+  try {
+    const { userId, email } = setEmailSchema.parse(req.body);
+    const normalized = email.toLowerCase();
+
+    const user = await db.user.findUnique({ where: { id: userId } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    // Email déjà rattaché à un AUTRE compte → conflit (évite le vol d'ancre)
+    const existing = await db.user.findFirst({
+      where: { email: normalized, id: { not: userId } },
+      select: { id: true },
+    });
+    if (existing) {
+      return res.status(409).json({
+        error: "Email already in use",
+        code: "EMAIL_IN_USE",
+      });
+    }
+
+    await db.user.update({ where: { id: userId }, data: { email: normalized } });
+    console.log(`📧 Email set for user ${userId}`);
+    return res.json({ ok: true, email: normalized });
+  } catch (err: any) {
+    if (err instanceof ZodError)
+      return res.status(400).json({ error: "Invalid email payload", details: err.flatten() });
+    console.error("PATCH /users/email error:", err);
+    return res.status(500).json({ error: "Email update failed" });
   }
 });
 
