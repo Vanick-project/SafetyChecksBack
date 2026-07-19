@@ -88,10 +88,10 @@ async function upsertPrimaryContact(
 // Un FREE règle son check-in ICI, une fois. On persiste exactement son choix
 // (interval / weekly / monthly). Absent → interval 24h.
 function buildOnboardingSchedule(input: {
-  checkInIntervalHours?: number;
-  schedule?: z.infer<typeof registerScheduleSchema>;
-  timezone?: string;
-  recurring?: boolean;
+  checkInIntervalHours?: number | undefined;
+  schedule?: z.infer<typeof registerScheduleSchema> | undefined;
+  timezone?: string | undefined;
+  recurring?: boolean | undefined;
 }) {
   const s = input.schedule ?? {};
   const type = s.scheduleType ?? "interval";
