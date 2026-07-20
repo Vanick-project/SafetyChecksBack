@@ -1,13 +1,13 @@
 // ─── src/services/twilio.ts ──────────────────────────────────────────────────
 //
 // PHASE 1 CASCADE :
-//   1. sendLocationSMS(alertId, contactId) et callEmergencyContact(alertId,
-//      contactId) ciblent désormais UN contact précis — la cascade décide lequel.
-//   2. Chaque AlertAction enregistre contactId → compteur de tentatives PAR
-//      contact + timeline par contact sur l'AlertScreen et le futur dashboard.
-//   3. sendEscalationSMS SUPPRIMÉ : la cascade remplace l'escalade (chaque
-//      contact reçoit son SMS géolocalisé au moment où il est engagé).
-//   4. La garde MAX_CALL_ATTEMPTS est désormais PAR CONTACT.
+//   1. sendLocationSMS / callEmergencyContact ciblent UN contact précis.
+//   2. Chaque AlertAction enregistre contactId (compteur par contact + timeline).
+//   3. La garde MAX_CALL_ATTEMPTS est PAR CONTACT.
+//   4. NOUVEAU : sendCascadeFailureSMS — SMS d'escalade envoyé à un contact
+//      quand la cascade a ÉCHOUÉ (aucun contact joint). Formulation plus
+//      pressante que le SMS initial. Idempotent par contact (destination
+//      "failure-escalation").
 
 import twilio from "twilio";
 import { db } from "../db/client.js";
@@ -52,6 +52,38 @@ function buildSMSBody(
   );
 }
 
+// SMS d'ÉCHEC — plus pressant. Envoyé quand PERSONNE n'a décroché après toute
+// la cascade. Le contact a déjà reçu le SMS initial : celui-ci signale que les
+// appels ont tous échoué et qu'une action immédiate est nécessaire.
+function buildFailureSMSBody(
+  contactName: string,
+  userName: string,
+  mapsLink: string | null,
+  language: string,
+): string {
+  if (language === "en") {
+    return (
+      `⚠️ URGENT — ${contactName},\n\n` +
+      `SafetyCheck tried to reach you by phone several times but no one answered. ` +
+      `We still cannot confirm that ${userName} is safe. ` +
+      `Please call 911 (US/Canada) or 112 (EU) NOW and request a wellness check` +
+      (mapsLink
+        ? ` at their last known location.\n\n📍 ${mapsLink}`
+        : `.`)
+    );
+  }
+
+  return (
+    `⚠️ URGENT — ${contactName},\n\n` +
+    `SafetyCheck a tente de vous joindre par telephone a plusieurs reprises sans reponse. ` +
+    `Nous ne pouvons toujours pas confirmer que ${userName} est en securite. ` +
+    `Veuillez appeler le 911 (Etats-Unis/Canada) ou le 112 (UE) MAINTENANT et demander une verification de bien-etre` +
+    (mapsLink
+      ? ` a sa derniere position connue.\n\n📍 ${mapsLink}`
+      : `.`)
+  );
+}
+
 /**
  * Charge l'alerte + l'utilisateur + LE contact ciblé, avec vérification
  * d'appartenance (le contact doit appartenir au propriétaire de l'alerte).
@@ -76,6 +108,14 @@ async function loadAlertAndContact(alertId: string, contactId: string) {
   return { alert, user: alert.user, contact };
 }
 
+function mapsLinkFor(alert: any, user: any): string | null {
+  const lat = alert.latAtTrigger ?? user.lastLat ?? null;
+  const lng = alert.lngAtTrigger ?? user.lastLng ?? null;
+  return lat != null && lng != null
+    ? `https://www.google.com/maps?q=${lat},${lng}`
+    : null;
+}
+
 // ─── SMS DE POSITION ──────────────────────────────────────────────────────────
 // Envoyé au contact au moment où la cascade l'engage (une fois par contact).
 
@@ -87,14 +127,7 @@ export async function sendLocationSMS(
 
   const userName = user.firstName ?? "your contact";
   const language = user.language ?? "fr";
-
-  // Coordonnées figées à l'alerte, sinon dernière position connue
-  const lat = alert.latAtTrigger ?? user.lastLat ?? null;
-  const lng = alert.lngAtTrigger ?? user.lastLng ?? null;
-  const mapsLink =
-    lat != null && lng != null
-      ? `https://www.google.com/maps?q=${lat},${lng}`
-      : null;
+  const mapsLink = mapsLinkFor(alert, user);
 
   const body = buildSMSBody(contact.name, userName, mapsLink, language);
 
@@ -123,6 +156,64 @@ export async function sendLocationSMS(
   return message.sid;
 }
 
+// ─── SMS D'ÉCHEC / ESCALADE ───────────────────────────────────────────────────
+// Envoyé quand la cascade est épuisée (aucun contact joint).
+// Idempotent par contact : destination "failure-escalation".
+
+export async function sendCascadeFailureSMS(
+  alertId: string,
+  contactId: string,
+): Promise<string | null> {
+  const { alert, user, contact } = await loadAlertAndContact(alertId, contactId);
+
+  // Déjà escaladé pour ce contact ? → ne pas renvoyer.
+  const already = await db.alertAction.findFirst({
+    where: {
+      alertId,
+      contactId: contact.id,
+      actionType: "SMS",
+      destination: "failure-escalation",
+    },
+    select: { id: true },
+  });
+  if (already) {
+    console.log(
+      `ℹ️ Failure SMS already sent to contact ${contact.id} for alert ${alertId}`,
+    );
+    return null;
+  }
+
+  const userName = user.firstName ?? "your contact";
+  const language = user.language ?? "fr";
+  const mapsLink = mapsLinkFor(alert, user);
+
+  const body = buildFailureSMSBody(contact.name, userName, mapsLink, language);
+
+  const message = await client.messages.create({
+    body,
+    from: FROM_NUMBER,
+    to: contact.phoneNumber,
+    statusCallback: `${BASE_URL}/twilio/sms-status`,
+  });
+
+  await db.alertAction.create({
+    data: {
+      alertId,
+      actionType: "SMS",
+      destination: "failure-escalation",
+      contactId: contact.id,
+      outcome: message.status,
+      providerSid: message.sid,
+      executedAt: new Date(),
+    },
+  });
+
+  console.log(
+    `🚨 Failure escalation SMS sent for alert ${alertId} → contact ${contact.id} → SID ${message.sid}`,
+  );
+  return message.sid;
+}
+
 // ─── VOICE CALL ──────────────────────────────────────────────────────────────
 
 export async function callEmergencyContact(
@@ -131,7 +222,6 @@ export async function callEmergencyContact(
 ): Promise<string> {
   const { user, contact } = await loadAlertAndContact(alertId, contactId);
 
-  // Garde PAR CONTACT — filet de sécurité si un job en double se glisse
   const previousAttempts = await db.alertAction.count({
     where: { alertId, actionType: "CALL", contactId: contact.id },
   });
@@ -145,8 +235,6 @@ export async function callEmergencyContact(
 
   const lang = user.language ?? "fr";
 
-  // /twiml/voice lit currentContactId en DB pour prononcer le bon nom —
-  // pas besoin de passer le contact dans l'URL.
   const twimlUrl =
     `${BASE_URL}/twiml/voice` +
     `?alertId=${encodeURIComponent(alertId)}` +

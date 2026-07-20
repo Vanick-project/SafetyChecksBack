@@ -28,7 +28,11 @@
 
 import { db } from "../db/client.js";
 import { MAX_CALL_ATTEMPTS } from "../config/constants.js";
-import { sendLocationSMS, callEmergencyContact } from "./twilio.js";
+import {
+  sendLocationSMS,
+  callEmergencyContact,
+  sendCascadeFailureSMS,
+} from "./twilio.js";
 import { resolveUserPlan, PLAN_LIMITS } from "./plan.js";
 
 type Contact = {
@@ -130,7 +134,7 @@ async function engageContact(alertId: string, contact: Contact): Promise<void> {
   );
 }
 
-/** Tous les contacts épuisés → alerte FAILED + trace d'audit. */
+/** Tous les contacts épuisés → alerte FAILED + SMS d'escalade + audit. */
 async function markCascadeExhausted(
   alertId: string,
   reason: string,
@@ -148,6 +152,32 @@ async function markCascadeExhausted(
       executedAt: new Date(),
     },
   });
+
+  // SMS D'ESCALADE : quand aucun contact n'a décroché après toute la cascade,
+  // on renvoie un SMS pressant à TOUS les contacts servis (respecte le plafond
+  // du plan : 1 en FREE, 3 en BASIC). Chacun a déjà reçu le SMS initial ;
+  // celui-ci signale que les appels ont échoué et qu'il faut agir maintenant.
+  // Ignoré si aucun contact n'était configuré (no_enabled_contact).
+  if (reason === "all_contacts_exhausted") {
+    const alert = await db.alertEvent.findUnique({
+      where: { id: alertId },
+      select: { userId: true },
+    });
+    if (alert) {
+      const contacts = await getEnabledContacts(alert.userId);
+      for (const contact of contacts) {
+        try {
+          await sendCascadeFailureSMS(alertId, contact.id);
+        } catch (err) {
+          console.error(
+            `❌ [cascade] Failure SMS failed for contact ${contact.id} — alert ${alertId}:`,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+    }
+  }
+
   console.log(`🛑 [cascade] ${reason} — alert ${alertId} marked FAILED`);
 }
 
