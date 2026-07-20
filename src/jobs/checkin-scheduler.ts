@@ -151,6 +151,29 @@ export async function scheduleCheckIn(userId: string) {
     console.warn("⚠️ Check-in queue unavailable (Redis disabled)");
     return;
   }
+  // GARDE RÉCURRENCE : un check-in non récurrent ne se reprogramme JAMAIS.
+  // Point de contrôle unique — protège tous les appelants (résolution
+  // d'alerte, réponse OK, etc.) contre une relance non désirée.
+  const u = await db.user.findUnique({
+    where: { id: userId },
+    select: { recurring: true },
+  });
+  if (u?.recurring === false) {
+    // On annule tout job résiduel et on marque le cycle comme terminé.
+    const stale = await Promise.all([
+      checkInQueue.getJob(`checkin-${userId}`),
+      checkInQueue.getJob(`checkin-reminder-${userId}`),
+      checkInQueue.getJob(`checkin-reminder-${userId}-attempt-2`),
+      checkInQueue.getJob(`checkin-reminder-${userId}-attempt-3`),
+      checkInQueue.getJob(`auto-sos-${userId}`),
+    ]);
+    await Promise.all(stale.map((j) => j?.remove()));
+    await db.user
+      .update({ where: { id: userId }, data: { checkInActive: false } })
+      .catch(() => {});
+    console.log(`⏹️ scheduleCheckIn skipped for ${userId} — non-recurring`);
+    return;
+  }
 
   const jobsToCancel = await Promise.all([
     checkInQueue.getJob(`checkin-${userId}`),
