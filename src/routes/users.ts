@@ -359,6 +359,54 @@ router.patch("/email", async (req: Request, res: Response) => {
   }
 });
 
+// PATCH /users/recurring — toggle isolé du flag "récurrent"
+// Accessible en FREE et BASIC (contrairement à /schedule qui exige Basic).
+// Ta règle : un FREE peut basculer ON/OFF sur son check-in choisi à l'inscription,
+// mais ne peut PAS changer les valeurs (intervalle, jour, heure).
+const setRecurringSchema = z.object({
+  userId: z.string().trim().min(10).max(100),
+  recurring: z.boolean(),
+});
+
+router.patch("/recurring", async (req: Request, res: Response) => {
+  try {
+    const { userId, recurring } = setRecurringSchema.parse(req.body);
+
+    const user = await db.user.findUnique({ where: { id: userId } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    // Toggle ON : on remet le compteur À MAINTENANT (le prochain check-in
+    // part depuis l'instant du toggle, pas depuis le dernier check-in qui
+    // peut dater d'il y a longtemps).
+    // Toggle OFF : scheduleCheckIn (via son garde recurring:false) va nettoyer.
+    await db.user.update({
+      where: { id: userId },
+      data: {
+        recurring,
+        checkInActive: recurring,
+        ...(recurring && { lastCheckInAt: new Date() }),
+      },
+    });
+
+    // ORDRE CRITIQUE : mettre à jour la DB AVANT scheduleCheckIn,
+    // sinon son garde interne (recurring:false → skip) bloque à tort.
+    await scheduleCheckIn(userId);
+
+    console.log(
+      `🔁 Recurring ${recurring ? "ENABLED" : "DISABLED"} for user ${userId}`,
+    );
+    return res.json({ ok: true, recurring });
+  } catch (err: any) {
+    if (err instanceof ZodError)
+      return res.status(400).json({
+        error: "Invalid recurring payload",
+        details: err.flatten(),
+      });
+    console.error("PATCH /users/recurring error:", err);
+    return res.status(500).json({ error: "Recurring update failed" });
+  }
+});
+
 // PATCH /users/language
 router.patch("/language", async (req: Request, res: Response) => {
   try {
