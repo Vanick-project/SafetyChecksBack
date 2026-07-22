@@ -10,6 +10,7 @@
 //     (code PLAN_REQUIRED_SCHEDULE). BASIC peut modifier à tout moment.
 //   - PATCH /email : NOUVEAU — ancre d'identité posée au moment de l'achat Basic.
 //   - GET /users/:id : renvoie emergencyContacts[] + emergencyContact (legacy).
+//   - DELETE /users/:id : NOUVEAU — suppression complète (RGPD + Play Store).
 
 import { Router } from "express";
 import type { Request, Response } from "express";
@@ -25,7 +26,8 @@ import {
   updateAlertSettingsSchema,
   updateNotificationsSettingsSchema,
 } from "../validators/schemas.js";
-import { scheduleCheckIn } from "../jobs/checkin-scheduler.js";
+import { scheduleCheckIn, checkInQueue } from "../jobs/checkin-scheduler.js";
+import { alertQueue } from "../jobs/alertQueue.js";
 import { canCustomizeSchedule, DEFAULT_CHECKIN_HOURS } from "../services/plan.js";
 
 const router = Router();
@@ -483,6 +485,73 @@ router.patch("/notifications-settings", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Invalid payload", details: err.flatten() });
     console.error("PATCH /users/notifications-settings error:", err);
     return res.status(500).json({ error: "Notifications update failed" });
+  }
+});
+
+// ─── DELETE /users/:id ───────────────────────────────────────────────────────
+// Suppression complète du compte (conformité RGPD + Play Store Data Deletion 2023).
+//
+// Cascade AUTOMATIQUE (schema.prisma `onDelete: Cascade`) :
+//   User → EmergencyContact, CheckInEvent, AlertEvent → AlertAction
+//
+// Suppression MANUELLE (userId nullable sans relation Prisma) :
+//   SupportMessage, SubscriptionEvent
+//
+// Sécurité : le header x-user-id doit correspondre à l'id de l'URL
+// (anti-usurpation minimale — même pattern que DELETE /contacts/:id).
+router.delete("/:id", async (req: Request, res: Response) => {
+  try {
+    const userId = String(req.params.id);
+    const headerUserId = Array.isArray(req.headers["x-user-id"])
+      ? req.headers["x-user-id"][0]
+      : req.headers["x-user-id"];
+
+    if (!headerUserId || headerUserId !== userId) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const user = await db.user.findUnique({ where: { id: userId } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    // 1) Purge BullMQ (sinon les workers crashent sur un user inexistant
+    //    quelques minutes plus tard). checkInQueue peut être null si
+    //    REDIS_URL n'est pas défini (garde défensive).
+    try {
+      const jobLists = await Promise.all([
+        checkInQueue
+          ? checkInQueue.getJobs(["delayed", "waiting", "active"])
+          : Promise.resolve([]),
+        alertQueue.getJobs(["delayed", "waiting", "active"]),
+      ]);
+      const [checkInJobs, alertJobs] = jobLists;
+
+      await Promise.all([
+        ...checkInJobs
+          .filter((j) => j?.data?.userId === userId)
+          .map((j) => j?.remove().catch(() => {})),
+        ...alertJobs
+          .filter((j) => j?.data?.userId === userId)
+          .map((j) => j?.remove().catch(() => {})),
+      ]);
+    } catch (queueErr) {
+      // Non bloquant : on log mais on continue la suppression DB
+      console.warn(`⚠️ Failed to purge BullMQ jobs for ${userId}:`, queueErr);
+    }
+
+    // 2) Suppression DB (transaction atomique — soit tout part, soit rien)
+    await db.$transaction([
+      db.supportMessage.deleteMany({ where: { userId } }),
+      db.subscriptionEvent.deleteMany({ where: { userId } }),
+      db.user.delete({ where: { id: userId } }),
+    ]);
+
+    console.log(
+      `🗑️ Account deleted for user ${userId} (${user.phoneNumber})`,
+    );
+    return res.json({ ok: true, deleted: true });
+  } catch (err) {
+    console.error("DELETE /users/:id error:", err);
+    return res.status(500).json({ error: "Delete failed" });
   }
 });
 
