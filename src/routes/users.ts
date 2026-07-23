@@ -198,6 +198,16 @@ router.patch("/fcm-token", async (req: Request, res: Response) => {
   try {
     const parsed = updateFcmTokenSchema.parse(req.body);
     const { userId, token } = parsed;
+
+    const user = await db.user.findUnique({
+      where: { id: userId },
+      select: { id: true },
+    });
+    if (!user) {
+      console.warn(`⚠️ PATCH /users/fcm-token : userId ${userId} not found (stale client)`);
+      return res.status(404).json({ error: "User not found", code: "USER_NOT_FOUND" });
+    }
+
     await db.user.update({ where: { id: userId }, data: { fcmToken: token } });
     return res.json({ ok: true });
   } catch (err: any) {
@@ -409,12 +419,23 @@ router.patch("/recurring", async (req: Request, res: Response) => {
   }
 });
 
+
 // PATCH /users/language
 router.patch("/language", async (req: Request, res: Response) => {
   try {
     const { userId, language } = req.body as { userId: string; language: string };
     if (!userId || !["fr", "en"].includes(language))
       return res.status(400).json({ error: "Invalid payload" });
+
+    // Vérifier que l'user existe AVANT le update (évite le P2025 en log)
+    const user = await db.user.findUnique({
+      where: { id: userId },
+      select: { id: true },
+    });
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
     await db.user.update({ where: { id: userId }, data: { language } });
     return res.json({ ok: true, language });
   } catch (err) {
